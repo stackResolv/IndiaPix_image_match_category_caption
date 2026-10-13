@@ -4,7 +4,8 @@ sort_photos.py — group edited photos with their camera originals.
 
 Goal: given a shoot that contains a folder of camera originals and a folder of
 edited derivatives, produce (1) a CSV report mapping every edit to its original
-and (2) a grouped output folder where each original sits next to its edit(s).
+and (2) a single flat "match" folder INSIDE the shoot that holds every matched
+original next to its edit(s). Edits with no matching original are ignored.
 
 Matching strategy, cheapest / most reliable first:
 
@@ -36,6 +37,15 @@ from pathlib import Path
 from PIL import Image, ExifTags
 import imagehash
 import numpy as np
+
+
+# Windows-safe console: force UTF-8 with a lossy fallback so filenames that
+# contain non-ASCII characters never crash printing on a cp1252 console.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
@@ -284,29 +294,43 @@ def process_shoot(shoot_dir: str, out_dir: str, args):
         else:
             unmatched.append(e)
 
-    # ---- write output ---------------------------------------------------- #
-    groups_dir = os.path.join(out_dir, "groups")
-    unmatched_dir = os.path.join(out_dir, "unmatched_edits")
-    os.makedirs(groups_dir, exist_ok=True)
-    if unmatched:
-        os.makedirs(unmatched_dir, exist_ok=True)
+    # ---- write output: one flat 'match' folder inside the shoot ---------- #
+    # Every matched original is copied next to its edit(s) directly inside
+    # <shoot>/match/. There are NO sub-folders: all pairs live flat in 'match'.
+    # Edits with no matching original are simply ignored (not copied anywhere).
+    os.makedirs(out_dir, exist_ok=True)
+    match_dir = os.path.join(shoot_dir, "match")
+    os.makedirs(match_dir, exist_ok=True)
+
+    seen = {}  # basename -> source already copied under that name
+
+    def copy_flat(src):
+        base = os.path.basename(src)
+        first = seen.get(base)
+        if first is None or first == src:
+            seen[base] = src
+            dest = os.path.join(match_dir, base)
+        else:
+            # Two different source files share a name — give the later one a
+            # unique suffix so nothing is overwritten.
+            stem, ext = os.path.splitext(base)
+            n = 1
+            dest = os.path.join(match_dir, f"{stem}_{n}{ext}")
+            while os.path.exists(dest):
+                n += 1
+                dest = os.path.join(match_dir, f"{stem}_{n}{ext}")
+        shutil.copy2(src, dest)
 
     group_ids = {}
     for i, o in enumerate(sorted(groups), 1):
-        gid = f"{i:04d}"
-        group_ids[o] = gid
-        gdir = os.path.join(groups_dir, f"{gid}_{Path(o).stem}")
-        os.makedirs(gdir, exist_ok=True)
-        shutil.copy2(o, os.path.join(gdir, os.path.basename(o)))
+        group_ids[o] = f"{i:04d}"
+        copy_flat(o)
         for e in groups[o]:
-            shutil.copy2(e, os.path.join(gdir, os.path.basename(e)))
-
-    for e in unmatched:
-        shutil.copy2(e, os.path.join(unmatched_dir, os.path.basename(e)))
+            copy_flat(e)
 
     # ---- write CSV report ------------------------------------------------ #
     report_path = os.path.join(out_dir, "report.csv")
-    with open(report_path, "w", newline="") as f:
+    with open(report_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["group_id", "edit_file", "matched_original", "method", "confidence", "distance", "burst_margin"])
         for e in sorted(match_map):
@@ -322,16 +346,9 @@ def process_shoot(shoot_dir: str, out_dir: str, args):
             ])
 
     # ---- summary --------------------------------------------------------- #
-    by_method = {}
-    for _o, method, _c, _d, _m in match_map.values():
-        by_method[method] = by_method.get(method, 0) + 1
-
-    print(f"  matched groups   : {len(groups)}")
-    print(f"  edits matched    : {len(match_map) - len(unmatched)}/{len(edits)}")
-    for m in sorted(by_method):
-        print(f"    - {m:<10}: {by_method[m]}")
-    if unmatched:
-        print(f"  unmatched edits  : {len(unmatched)} (see unmatched_edits/)")
+    print(f"  edits matched    : {len(match_map) - len(unmatched)}")
+    print(f"  edits unmatched  : {len(unmatched)}")
+    print(f"  match folder     : {match_dir}")
     print(f"  report           : {report_path}")
 
     return {
@@ -357,8 +374,8 @@ def build_parser():
     src.add_argument("--root", help="path to a parent folder; every sub-folder is treated as a shoot")
 
     p.add_argument("--out", required=True, help="output folder (created if missing; sources are never modified)")
-    p.add_argument("--originals-name", default="Camera Original ID",
-                   help="name of the originals sub-folder (default: 'Camera Original ID')")
+    p.add_argument("--originals-name", default="JPEG",
+                   help="name of the originals sub-folder (default: 'JPEG')")
     p.add_argument("--edits-name", default="Edit",
                    help="name of the edits sub-folder (default: 'Edit')")
     p.add_argument("--hash-size", type=int, default=16,

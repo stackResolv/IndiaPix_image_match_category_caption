@@ -1,38 +1,29 @@
 #!/bin/bash
-# run.sh — one-shot runner for the photo sorting + categorizing pipeline.
+# =============================================================================
+# run.sh - macOS / Linux one-command runner for the photo matching + cataloging
+#          pipeline. Mirrors run.bat so the same commands work everywhere.
 #
 # Usage:
-#   ./run.sh                          # defaults: shoot "_sort images", out "sorted_output"
-#   ./run.sh "MyShoot" "my_output"    # custom shoot folder + output folder
+#   ./run.sh                              # default shoot "_sort images"
+#   ./run.sh "input_folder"               # every shoot inside it
+#   ./run.sh "MyShoot" "my_output"        # single shoot + custom output
+#   ./run.sh "input_folder" "my_output"   # batch + custom output base
 #
-# Runs both steps:
-#   1. sort_photos.py  -> groups each edit with its matching original
-#   2. categorize.py   -> adds category + caption, writes Excel
+# Delegates to run.py, which detects whether the path is a single shoot or a
+# parent folder of shoots, then runs both steps: sort_photos.py + categorize.py.
+# =============================================================================
 
 set -e
 
-SHOOT="${1:-_sort images}"
-OUT="${2:-sorted_output}"
+# Force UTF-8 for the console and for any child Python processes.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
 
-echo "=================================================================="
-echo " Step 1/2: matching edits to originals"
-echo "   shoot : $SHOOT"
-echo "   out   : $OUT"
-echo "=================================================================="
-python3 sort_photos.py --shoot "$SHOOT" --out "$OUT"
+# Prefer python3, fall back to python.
+if command -v python3 >/dev/null 2>&1; then
+    PY=python3
+else
+    PY=python
+fi
 
-echo ""
-echo "=================================================================="
-echo " Step 2/2: categorizing + captioning edits"
-echo "=================================================================="
-python3 categorize.py \
-  --edit-dir "$SHOOT/Edit" \
-  --report "$OUT/report.csv" \
-  --out "$OUT/photos.xlsx"
-
-echo ""
-echo "Done. Results:"
-echo "  Excel   : $OUT/photos.xlsx"
-echo "  Report  : $OUT/report.csv"
-echo "  Groups  : $OUT/groups/"
-echo "  Debug   : $OUT/categorize_debug.log"
+exec "$PY" run.py "$@"

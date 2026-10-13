@@ -14,8 +14,18 @@ categorize_out/
 *.xlsx
 *.zip
 
-# Source photo library (large; never commit)
+# Pipeline outputs (created next to the shoots)
+match/
+_out/
+report.csv
+categorize_debug.log
+labels_cache.json
+
+# Source photo library / sample inputs (large; never commit)
 _sort images/
+_sort_images_2/
+Paltu/
+input_folder/
 
 # Python
 __pycache__/

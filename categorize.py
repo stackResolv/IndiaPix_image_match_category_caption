@@ -12,15 +12,19 @@ Categories (fixed):
   - White Background     : plain white/studio seamless backdrop
   - Others               : everything else
 
-Provider: Anthropic Claude (vision). Default model: claude-haiku-4-5 (cheap+fast).
+Providers (vision LLM), chosen with --provider {auto,anthropic,openai}:
+  - anthropic (default): claude-haiku-4-5  -> ANTHROPIC_API_KEY
+  - openai            : gpt-4o-mini       -> OPENAI_API_KEY
+  - auto (default)    : pick whichever key is present (.env / environment)
 
 Usage:
   python3 categorize.py --edit-dir "_sort images/Edit" \
                         --report sorted_output/report.csv \
                         --out sorted_output/photos.xlsx
+  python3 categorize.py ... --provider openai
 
-The API key is read from (in order): --api-key, $ANTHROPIC_API_KEY, or a .env
-file sitting next to this script. Nothing is hard-coded.
+The API key is read from (in order): --api-key, the provider's env var, or a
+.env file sitting next to this script. Nothing is hard-coded.
 """
 
 import argparse
@@ -42,9 +46,21 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 
+# Windows-safe console: force UTF-8 with a lossy fallback so non-ASCII filenames
+# or captions never crash printing on a cp1252 console.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 CATEGORIES = ["Portrait", "Traditional/Festival", "White Background", "Others"]
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 # Longest side (px) of the image we send to the model. Small = cheap, still clear.
 SEND_MAX = 640
@@ -76,7 +92,7 @@ PROMPT = (
 def load_dotenv(path):
     env = {}
     if os.path.isfile(path):
-        for line in open(path):
+        for line in open(path, encoding="utf-8", errors="replace"):
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -85,13 +101,34 @@ def load_dotenv(path):
     return env
 
 
-def resolve_key(arg_key):
+def provider_env_names(provider):
+    return ["OPENAI_API_KEY"] if provider == "openai" else ["ANTHROPIC_API_KEY"]
+
+
+def detect_provider(requested):
+    """Return 'anthropic' or 'openai'. If 'auto', pick whichever key is present."""
+    if requested in ("anthropic", "openai"):
+        return requested
+    here = os.path.dirname(os.path.abspath(__file__))
+    env = load_dotenv(os.path.join(here, ".env"))
+    if os.environ.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.environ.get("OPENAI_API_KEY") or env.get("OPENAI_API_KEY"):
+        return "openai"
+    return "anthropic"
+
+
+def resolve_key(arg_key, provider):
     if arg_key:
         return arg_key
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return os.environ["ANTHROPIC_API_KEY"]
     here = os.path.dirname(os.path.abspath(__file__))
-    return load_dotenv(os.path.join(here, ".env")).get("ANTHROPIC_API_KEY")
+    env = load_dotenv(os.path.join(here, ".env"))
+    for name in provider_env_names(provider):
+        if os.environ.get(name):
+            return os.environ[name]
+        if env.get(name):
+            return env[name]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -125,7 +162,19 @@ def parse_json_loose(text):
 # --------------------------------------------------------------------------- #
 # LLM call
 # --------------------------------------------------------------------------- #
-def classify_image(b64, api_key, model, retries=3):
+def _normalise(data):
+    cat = str(data.get("category", "")).strip()
+    cap = str(data.get("caption", "")).strip()
+    for c in CATEGORIES:
+        if c.lower() == cat.lower():
+            cat = c
+            break
+    else:
+        cat = "Others"
+    return cat, cap
+
+
+def _classify_anthropic(b64, api_key, model, retries=3):
     headers = {
         "x-api-key": api_key,
         "anthropic-version": ANTHROPIC_VERSION,
@@ -156,16 +205,7 @@ def classify_image(b64, api_key, model, retries=3):
                 raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
             r.raise_for_status()
             content = r.json()["content"][0]["text"]
-            data = parse_json_loose(content)
-            cat = str(data.get("category", "")).strip()
-            cap = str(data.get("caption", "")).strip()
-            for c in CATEGORIES:
-                if c.lower() == cat.lower():
-                    cat = c
-                    break
-            else:
-                cat = "Others"
-            return cat, cap
+            return _normalise(parse_json_loose(content))
         except Exception as e:
             if attempt == retries - 1:
                 return "ERROR", f"({e})"
@@ -174,11 +214,52 @@ def classify_image(b64, api_key, model, retries=3):
     return "ERROR", ""
 
 
+def _classify_openai(b64, api_key, model, retries=3):
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    data_url = f"data:image/jpeg;base64,{b64}"
+    payload = {
+        "model": model,
+        "max_tokens": 120,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "low"}},
+                ],
+            }
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    delay = 1.0
+    for attempt in range(retries):
+        try:
+            r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=90)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"]
+            return _normalise(parse_json_loose(content))
+        except Exception as e:
+            if attempt == retries - 1:
+                return "ERROR", f"({e})"
+            time.sleep(delay)
+            delay *= 2
+    return "ERROR", ""
+
+
+def classify_image(b64, api_key, model, provider="anthropic", retries=3):
+    if provider == "openai":
+        return _classify_openai(b64, api_key, model, retries)
+    return _classify_anthropic(b64, api_key, model, retries)
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def read_report(report_path):
-    with open(report_path, newline="") as f:
+    with open(report_path, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
@@ -188,16 +269,28 @@ def main():
     ap.add_argument("--report", default="sorted_output/report.csv",
                     help="report.csv from sort_photos.py (edit -> original map)")
     ap.add_argument("--out", default="sorted_output/photos.xlsx", help="output Excel file")
-    ap.add_argument("--model", default="claude-haiku-4-5-20251001")
-    ap.add_argument("--api-key", default=None, help="Anthropic key (else env/.env)")
+    ap.add_argument("--provider", default="auto", choices=["auto", "anthropic", "openai"],
+                    help="vision LLM provider (default: auto-detect from available keys)")
+    ap.add_argument("--model", default=None,
+                    help="model name (default: claude-haiku-4-5 for anthropic, gpt-4o-mini for openai)")
+    ap.add_argument("--api-key", default=None, help="API key (else env/.env)")
     ap.add_argument("--workers", type=int, default=6, help="parallel requests")
     ap.add_argument("--limit", type=int, default=0, help="only process first N (testing)")
     ap.add_argument("--no-cache", action="store_true", help="ignore cached labels")
     args = ap.parse_args()
 
-    api_key = resolve_key(args.api_key)
+    provider = detect_provider(args.provider)
+    api_key = resolve_key(args.api_key, provider)
     if not api_key:
-        sys.exit("error: no Anthropic API key (use --api-key, $ANTHROPIC_API_KEY, or .env)")
+        keyname = "OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY"
+        sys.exit(f"error: no {provider} API key (use --api-key, ${keyname}, or .env)")
+    model = args.model or (DEFAULT_OPENAI_MODEL if provider == "openai" else DEFAULT_ANTHROPIC_MODEL)
+
+    # make sure the output folder exists (categorize.py can be run standalone,
+    # not only after sort_photos.py has created it)
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     rows = read_report(args.report)
     if args.limit:
@@ -207,13 +300,13 @@ def main():
     edits = [f for f in sorted(os.listdir(args.edit_dir))
              if f.lower().endswith((".jpg", ".jpeg", ".png")) and f in by_edit]
 
-    print(f"Classifying {len(edits)} edit(s) with {args.model} ...")
+    print(f"Classifying {len(edits)} edit(s) with {provider} ({model}) ...")
 
     cache_path = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".", "labels_cache.json")
     cache = {}
     if not args.no_cache and os.path.isfile(cache_path):
         try:
-            cache = json.load(open(cache_path))
+            cache = json.load(open(cache_path, encoding="utf-8"))
         except Exception:
             cache = {}
 
@@ -226,7 +319,7 @@ def main():
             return fname, tuple(cache[fname])
         try:
             b64 = image_to_data_url(os.path.join(args.edit_dir, fname))
-            cat, cap = classify_image(b64, api_key, args.model)
+            cat, cap = classify_image(b64, api_key, model, provider)
         except Exception as e:
             cat, cap = "ERROR", f"({e})"
         with lock:
@@ -241,7 +334,7 @@ def main():
     with lock:
         for fname, res in results.items():
             cache[fname] = list(res)
-        json.dump(cache, open(cache_path, "w"), indent=0)
+        json.dump(cache, open(cache_path, "w", encoding="utf-8"), indent=0)
 
     order = {c: i for i, c in enumerate(CATEGORIES)}
     sorted_edits = sorted(results, key=lambda f: (order.get(results[f][0], 99), f))
@@ -284,7 +377,7 @@ def main():
     # ---- write debug log (match diagnostics for troubleshooting) ---------- #
     log_path = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".",
                             "categorize_debug.log")
-    with open(log_path, "w", newline="") as lf:
+    with open(log_path, "w", newline="", encoding="utf-8") as lf:
         lw = csv.writer(lf)
         lw.writerow(["group_id", "edit_file", "matched_original", "category",
                      "method", "confidence", "distance", "burst_margin", "caption"])

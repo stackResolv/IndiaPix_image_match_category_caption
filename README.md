@@ -69,13 +69,18 @@ python3 -m pip install -r requirements.txt
 
 ## Running on Windows
 
-`sort_photos.py` and `categorize.py` are pure Python and run unchanged on
-Windows. Only the way you launch them differs.
+Everything is pure Python and runs unchanged on Windows — only the launch
+command differs. `run.bat` is the Windows counterpart of `run.sh` and both
+delegate to the same `run.py`, so behaviour is identical across platforms.
 
-1. **Install Python** (https://www.python.org/downloads/) — tick "Add Python to PATH".
+1. **Install Python** (https://www.python.org/downloads/) — tick
+   **"Add Python to PATH"** during setup.
 2. **Open a terminal in the project folder** (in File Explorer type `cmd` in the
    address bar, or in VS Code use Terminal → New Terminal).
-3. **Install dependencies once:**  `python -m pip install -r requirements.txt`
+3. **Install dependencies once:**
+   ```bat
+   python -m pip install -r requirements.txt
+   ```
 4. **Create your key file** — the `.env` holding your API key is NOT cloned
    (it is git-ignored). Recreate it:
    ```bat
@@ -88,24 +93,38 @@ Windows. Only the way you launch them differs.
    run.bat
    ```
    ```bat
-   python run.py
+   run.bat "input_folder"
+   ```
+   ```bat
+   python run.py "input_folder"
    ```
    ```bat
    python sort_photos.py --shoot "_sort images" --out "sorted_output"
-   python categorize.py --edit-dir "_sort images/Edit" --report sorted_output/report.csv --out sorted_output/photos.xlsx
+   python categorize.py --edit-dir "_sort images/Edit" --report sorted_output\report.csv --out sorted_output\photos.xlsx
    ```
-6. **Open the result:** `start sorted_output\photos.xlsx`
+6. **Open the result:** `start input_folder\_sort images\_out\photos.xlsx`
 
-> Use forward slashes `/` in the command arguments (as above) — they work on
-> Windows too and avoid backslash-escaping issues.
+> The tool works with **forward slashes `/` or backslashes `\`** in arguments —
+> either is fine on Windows.
+
+`run.bat` handles the common Windows papercuts for you:
+- **Finds Python automatically** — uses the `py -3` launcher if present, else
+  `python` on PATH; prints a clear message if neither is found.
+- **UTF-8 console** (`chcp 65001`) + `PYTHONUTF8=1` so non-ASCII filenames never
+  crash with a `UnicodeEncodeError`.
+- **Keeps the window open on error** (`pause`) so a failure is readable even when
+  the file is double-clicked.
 
 ### Windows vs macOS — what actually changes
-| Thing | Windows |
-|---|---|
-| `sort_photos.py`, `categorize.py` | No change — already cross-platform |
-| `python3` | use `python` |
-| `./run.sh` | use `run.bat` or `python run.py` |
-| `.env` (API key) | recreate from `.env.example` |
+| Thing | Windows | macOS / Linux |
+|---|---|---|
+| Launcher | `run.bat` (or `python run.py`) | `./run.sh` (or `python3 run.py`) |
+| Interpreter | `python` / `py -3` | `python3` |
+| Console UTF-8 | handled by `run.bat` (`chcp 65001`) | handled by `run.sh` |
+| `.env` (API key) | recreate from `.env.example` | same |
+
+> You can also **double-click `run.bat`** in File Explorer — it runs with the
+> default shoot and pauses at the end so you can read the output.
 
 ---
 
@@ -118,17 +137,25 @@ python3 sort_photos.py --shoot "_sort images" --out "sorted_output"
 ```
 
 `_sort images` must contain two sub-folders (originals + edits). By default the
-tool expects `Camera Original ID` and `Edit`, and otherwise auto-detects via
-folder-name hints (`original`, `camera`, `edit`, `final`, ...).
+tool expects `JPEG` and `Edit`, and otherwise auto-detects via folder-name hints
+(`original`, `camera`, `raw`, `edit`, `final`, ...).
 
 ### Batch — many shoots at once
 
+Point any entry point at the **parent folder** and every shoot inside it is
+processed. A folder is treated as a shoot if it contains an originals
+(`JPEG`) and/or edits (`Edit`) sub-folder.
+
 ```bash
-python3 sort_photos.py --root "/path/to/AllShoots" --out "sorted_output"
+# run the whole pipeline (match + captions) for every shoot under input_folder
+python3 run.py "input_folder"
+
+# or just the matching step
+python3 sort_photos.py --root "input_folder" --out "sorted_output"
 ```
 
-Every sub-folder of `AllShoots` is treated as its own shoot and given its own
-output folder.
+Each shoot gets its own flat `match/` folder and its own `_out/` (report + Excel).
+With `run.py`, omitting the output argument writes results to `<shoot>/_out`.
 
 ### Custom sub-folder names
 
@@ -144,7 +171,7 @@ python3 sort_photos.py --shoot "MyShoot" --out "out" \
 | `--shoot` | — | One shoot folder (mutually exclusive with `--root`) |
 | `--root` | — | Parent folder; each sub-folder is a shoot |
 | `--out` | *(required)* | Output folder (created if missing) |
-| `--originals-name` | `Camera Original ID` | Name of the originals sub-folder |
+| `--originals-name` | `JPEG` | Name of the originals sub-folder |
 | `--edits-name` | `Edit` | Name of the edits sub-folder |
 | `--hash-size` | `16` | pHash size (bits per side) |
 | `--phash-threshold` | `48` | Max pHash distance for a Tier-3 match |
@@ -153,17 +180,33 @@ python3 sort_photos.py --shoot "MyShoot" --out "out" \
 
 ## Output
 
+The grouped photos go into a single flat `match/` folder **inside each shoot
+folder** (next to the originals and edits folders). Every matched original is
+copied in beside its edit(s) — there are **no sub-folders**, so all pairs sit in
+`match/` together. Edits with no matching original are **ignored** (not copied
+anywhere).
+
 ```
-sorted_output/
+_sort images/
+  JPEG/                     ← source (never modified)
+  Edit/                     ← source (never modified)
+  match/                    ← created by the tool, flat, one level only
+    4C8A2376.JPG            ← an original
+    PRHM5402DF.JPG          ← its matched edit
+    4C8A2377.JPG            ← another original
+    PRHM5403DF.JPG
+    ...
+
+sorted_output/              ← report + Excel only
   report.csv
-  groups/
-    0001_4C8A2376/          ← one folder per edited photo
-      4C8A2376.JPG          ← the original
-      PRHM5402DF.JPG        ← its edit
-    0002_...
-  unmatched_edits/          ← edits with no confident match (manual review)
-    PRHM5472DF.JPG
 ```
+
+Every entry in `match/` belongs to a pair: an original is only copied when it has
+at least one matched edit, and an edit is only copied when it has a matched
+original. So `match/` never contains a lone edit (or a lone original).
+
+> If two different source files happen to share the same file name, the later
+> one is copied with a numeric suffix (`name_1.JPG`) so nothing is overwritten.
 
 **`report.csv` columns**
 
@@ -177,7 +220,9 @@ sorted_output/
 | `distance` | Comparison distance (0 for exact `exif` matches) |
 | `burst_margin` | How clearly the exact burst frame won (blank when not a burst) |
 
-**No files are renamed.** Editing is grouped, not renamed, by design.
+**No files are renamed.** Editing is grouped, not renamed, by design. Matched
+files are only *copied* into `match/`; the originals and edits folders are left
+untouched.
 
 ---
 
@@ -210,8 +255,32 @@ python3 categorize.py --edit-dir "_sort images/Edit" \
 3. White Background — plain white studio backdrop
 4. Others — everything else (product, warehouse, scenery, ...)
 
-**The API key** is read from (in order): `--api-key`, `$ANTHROPIC_API_KEY`, or the
-`.env` file next to this script (git-ignored). Nothing is hard-coded.
+**Provider / model** — two vision providers are supported, chosen with
+`--provider` (default `auto`, which picks whichever key is present):
+
+| `--provider` | Default model | Key used |
+|---|---|---|
+| `anthropic` (default) | `claude-haiku-4-5-20251001` | `ANTHROPIC_API_KEY` |
+| `openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| `auto` | whichever key is present | — |
+
+```bash
+# use OpenAI instead of Anthropic
+python3 categorize.py --edit-dir "_sort images/Edit" \
+                      --report sorted_output/report.csv \
+                      --out sorted_output/photos.xlsx --provider openai
+
+# override the model too
+python categorize.py ... --provider openai --model gpt-4o
+```
+
+> **Note:** the OpenAI account must have credits (a key with no balance returns
+> HTTP 429 "no credits remaining"). Anthropic worked in testing because that key
+> has credit. Both providers cost roughly the same (~a few cents per 159 images).
+
+**The API key** is read from (in order): `--api-key`, the provider's env var
+(`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`), or the `.env` file next to this script
+(git-ignored). Nothing is hard-coded.
 
 **Cost / scale:** each image is downscaled (longest side 640 px) and sent once.
 Roughly ~$0.001–0.002 per image with Haiku → pennies for a normal shoot
@@ -231,8 +300,9 @@ written to `sorted_output/categorize_debug.log` instead, for debugging.
 | `--edit-dir` | *(required)* | Folder holding the edits |
 | `--report` | `sorted_output/report.csv` | Edit→original map from step 1 |
 | `--out` | `sorted_output/photos.xlsx` | Output Excel file |
-| `--model` | `claude-haiku-4-5-20251001` | Anthropic vision model |
-| `--api-key` | env/.env | Anthropic API key |
+| `--provider` | `auto` | `auto`, `anthropic`, or `openai` |
+| `--model` | provider default | e.g. `claude-haiku-4-5-20251001` / `gpt-4o-mini` |
+| `--api-key` | env/.env | API key for the chosen provider |
 | `--workers` | `6` | Parallel requests |
 | `--limit` | `0` | Only first N images (testing) |
 | `--no-cache` | off | Ignore cached labels |
