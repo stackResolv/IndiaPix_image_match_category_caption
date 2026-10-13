@@ -1,0 +1,22 @@
+# Secrets (real keys) — keep private
+.env
+
+# But DO commit the template
+!.env.example
+
+# Generated outputs
+sorted_output/
+sorted_output_test/
+sorted_output.zip
+vision_all.jsonl
+vision_probe
+categorize_out/
+*.xlsx
+*.zip
+
+# Source photo library (large; never commit)
+_sort images/
+
+# Python
+__pycache__/
+*.pyc
