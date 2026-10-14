@@ -8,6 +8,8 @@ Usage:
     python run.py "input_folder"                    # batch: every shoot inside it
     python run.py "MyShoot" "my_output"             # single shoot + custom output
     python run.py "input_folder" "my_output"        # batch + custom output base
+    python run.py "input_folder" --provider openai  # use OpenAI for captions
+    python run.py "input_folder" --provider openai --model gpt-4o
 
 A shoot is any folder that contains an originals sub-folder (default "JPEG")
 and/or an edits sub-folder (default "Edit").
@@ -91,6 +93,11 @@ def main():
                     help="name of the originals sub-folder")
     ap.add_argument("--edits-name", default="Edit",
                     help="name of the edits sub-folder")
+    ap.add_argument("--provider", default="auto", choices=["auto", "anthropic", "openai"],
+                    help="vision LLM provider for captions (default: auto-detect from keys)")
+    ap.add_argument("--model", default=None,
+                    help="model name (default: claude-haiku-4-5 for anthropic, "
+                         "gpt-4o-mini for openai)")
     args = ap.parse_args()
 
     shoots = detect_shoots(args.input, args.originals_name, args.edits_name)
@@ -116,11 +123,15 @@ def main():
              "--edits-name", args.edits_name])
 
         print()
-        print(" Step 2/2: categorizing + captioning edits")
-        run([sys.executable, "categorize.py",
-             "--edit-dir", edit_dir,
-             "--report", os.path.join(out, "report.csv"),
-             "--out", os.path.join(out, "photos.xlsx")])
+        print(f" Step 2/2: categorizing + captioning edits  (provider: {args.provider})")
+        cat_cmd = [sys.executable, "categorize.py",
+                   "--edit-dir", edit_dir,
+                   "--report", os.path.join(out, "report.csv"),
+                   "--out", os.path.join(out, "photos.xlsx"),
+                   "--provider", args.provider]
+        if args.model:
+            cat_cmd += ["--model", args.model]
+        run(cat_cmd)
 
     print()
     print("Done. Results:")

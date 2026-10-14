@@ -265,13 +265,28 @@ python3 categorize.py --edit-dir "_sort images/Edit" \
 | `auto` | whichever key is present | — |
 
 ```bash
-# use OpenAI instead of Anthropic
+# Step 2 only — use OpenAI instead of Anthropic
 python3 categorize.py --edit-dir "_sort images/Edit" \
                       --report sorted_output/report.csv \
                       --out sorted_output/photos.xlsx --provider openai
 
 # override the model too
 python categorize.py ... --provider openai --model gpt-4o
+```
+
+**Run the whole pipeline (match + captions) with OpenAI in one command** — the
+provider flag is passed straight through `run.py` (and therefore `run.bat` /
+`run.sh`):
+
+```bash
+# macOS / Linux
+./run.sh "input_folder" --provider openai
+
+# Windows
+run.bat "input_folder" --provider openai
+
+# or directly, with a specific model
+python3 run.py "input_folder" --provider openai --model gpt-4o
 ```
 
 > **Note:** the OpenAI account must have credits (a key with no balance returns

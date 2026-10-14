@@ -8,9 +8,12 @@ REM   run.bat                              (default shoot "_sort images")
 REM   run.bat "input_folder"               (every shoot inside it)
 REM   run.bat "MyShoot" "my_output"        (single shoot + custom output)
 REM   run.bat "input_folder" "my_output"   (batch + custom output base)
+REM   run.bat "input_folder" --provider openai                 (use OpenAI for captions)
+REM   run.bat "input_folder" --provider openai --model gpt-4o  (override the model)
 REM
-REM Delegates to run.py, which detects whether the path is a single shoot or a
-REM parent folder of shoots, then runs both steps: sort_photos.py + categorize.py.
+REM Delegates to run.py (all arguments are forwarded verbatim via %*), which
+REM detects whether the path is a single shoot or a parent folder of shoots,
+REM then runs both steps: sort_photos.py + categorize.py.
 REM ===========================================================================
 
 setlocal enableextensions
