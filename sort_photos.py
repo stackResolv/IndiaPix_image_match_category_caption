@@ -32,11 +32,13 @@ import csv
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
-from PIL import Image, ExifTags
 import imagehash
 import numpy as np
+
+from imageutil import IMG_EXTS, capture_time, load_image
 
 
 # Windows-safe console: force UTF-8 with a lossy fallback so filenames that
@@ -47,13 +49,14 @@ try:
 except Exception:
     pass
 
+# Wall-clock start, used by log() so long runs never look "stuck".
+_T0 = time.time()
 
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
 
-# EXIF tag ids we care about
-TAG_DATETIME = 306            # DateTime
-TAG_DATETIME_ORIGINAL = 36867  # DateTimeOriginal (capture time)
-TAG_SUBSEC_TIME_ORIGINAL = 37520  # SubsecTimeOriginal
+def log(msg, indent=2):
+    """Print a timestamped, flushed progress line."""
+    print(f"{' ' * indent}[{time.time() - _T0:6.1f}s] {msg}", flush=True)
+
 
 # Heuristic folder-name hints for auto-detection
 ORIGINAL_HINTS = ("original", "orig", "camera", "raw", "source", "unedit")
@@ -76,33 +79,24 @@ def list_images(folder: str):
 
 
 def read_capture_time(path: str):
-    """Return the capture timestamp string (DateTimeOriginal) or None."""
-    try:
-        with Image.open(path) as im:
-            exif = im.getexif()
-            try:
-                ifd = exif.get_ifd(ExifTags.IFD.Exif)
-            except Exception:
-                ifd = {}
-            dto = ifd.get(TAG_DATETIME_ORIGINAL)
-            if dto:
-                return str(dto)
-            dt = exif.get(TAG_DATETIME)
-            if dt:
-                return str(dt)
-    except Exception:
-        return None
-    return None
+    """Return the capture timestamp string (DateTimeOriginal) or None.
+
+    Delegates to imageutil.capture_time so RAW files (e.g. Canon .cr3) are
+    handled as well as ordinary raster files.
+    """
+    return capture_time(path)
 
 
 def phash_of(path: str, hash_size: int = 16, normalize_orientation: bool = True):
     """Perceptual hash, normalised to landscape so 90-degree rotations still match."""
     try:
-        with Image.open(path) as im:
-            im = im.convert("L")
-            if normalize_orientation and im.height > im.width:
-                im = im.rotate(-90, expand=True)
-            return imagehash.phash(im, hash_size=hash_size)
+        im = load_image(path)
+        if im is None:
+            return None
+        im = im.convert("L")
+        if normalize_orientation and im.height > im.width:
+            im = im.rotate(-90, expand=True)
+        return imagehash.phash(im, hash_size=hash_size)
     except Exception:
         return None
 
@@ -114,12 +108,14 @@ def gray_vec(path: str, n: int = 64, normalize_orientation: bool = True):
     frame inside a same-second burst, and to score how confident that pick is.
     """
     try:
-        with Image.open(path) as im:
-            im = im.convert("L")
-            if normalize_orientation and im.height > im.width:
-                im = im.rotate(-90, expand=True)
-            im = im.resize((n, n))
-            a = np.asarray(im, dtype=np.float32)
+        im = load_image(path)
+        if im is None:
+            return None
+        im = im.convert("L")
+        if normalize_orientation and im.height > im.width:
+            im = im.rotate(-90, expand=True)
+        im = im.resize((n, n))
+        a = np.asarray(im, dtype=np.float32)
         return (a - a.mean()) / (a.std() + 1e-6)
     except Exception:
         return None
@@ -200,19 +196,23 @@ def process_shoot(shoot_dir: str, out_dir: str, args):
     originals = list_images(os.path.join(shoot_dir, odir_name))
     edits = list_images(os.path.join(shoot_dir, edir_name))
 
-    print(f"  originals folder : {odir_name}  ({len(originals)} images)")
-    print(f"  edits folder     : {edir_name}  ({len(edits)} images)")
+    print(f"  originals folder : {odir_name}  ({len(originals)} images)", flush=True)
+    print(f"  edits folder     : {edir_name}  ({len(edits)} images)", flush=True)
 
     if not edits:
         print("  [skip] no edits found")
         return None
 
     # ---- index originals by capture time -------------------------------- #
+    log(f"reading capture time from {len(originals)} original(s) ...")
     by_time = {}
-    for o in originals:
+    for i, o in enumerate(originals, 1):
         t = read_capture_time(o)
         if t:
             by_time.setdefault(t, []).append(o)
+        if i % 20 == 0 or i == len(originals):
+            log(f"  originals read: {i}/{len(originals)}")
+    log(f"indexed {len(by_time)} distinct capture time(s)")
 
     # lazy caches
     orig_hash_cache = {}
@@ -224,7 +224,10 @@ def process_shoot(shoot_dir: str, out_dir: str, args):
 
     # ---- match every edit ----------------------------------------------- #
     match_map = {}  # edit_path -> (original_path|None, method, confidence, distance)
-    for e in edits:
+    log(f"matching {len(edits)} edit(s) to originals ...")
+    for e_idx, e in enumerate(edits, 1):
+        if e_idx == 1 or e_idx % 5 == 0 or e_idx == len(edits):
+            log(f"  edits processed: {e_idx - 1}/{len(edits)}")
         t = read_capture_time(e)
         candidates = by_time.get(t, []) if t else []
 
@@ -321,12 +324,16 @@ def process_shoot(shoot_dir: str, out_dir: str, args):
                 dest = os.path.join(match_dir, f"{stem}_{n}{ext}")
         shutil.copy2(src, dest)
 
+    ordered_groups = sorted(groups)
+    log(f"copying {len(ordered_groups)} matched group(s) into '{match_dir}' ...")
     group_ids = {}
-    for i, o in enumerate(sorted(groups), 1):
+    for i, o in enumerate(ordered_groups, 1):
         group_ids[o] = f"{i:04d}"
         copy_flat(o)
         for e in groups[o]:
             copy_flat(e)
+        if i % 20 == 0 or i == len(ordered_groups):
+            log(f"  groups copied: {i}/{len(ordered_groups)}")
 
     # ---- write CSV report ------------------------------------------------ #
     report_path = os.path.join(out_dir, "report.csv")
@@ -346,10 +353,10 @@ def process_shoot(shoot_dir: str, out_dir: str, args):
             ])
 
     # ---- summary --------------------------------------------------------- #
-    print(f"  edits matched    : {len(match_map) - len(unmatched)}")
-    print(f"  edits unmatched  : {len(unmatched)}")
-    print(f"  match folder     : {match_dir}")
-    print(f"  report           : {report_path}")
+    print(f"  edits matched    : {len(match_map) - len(unmatched)}", flush=True)
+    print(f"  edits unmatched  : {len(unmatched)}", flush=True)
+    print(f"  match folder     : {match_dir}", flush=True)
+    print(f"  report           : {report_path}", flush=True)
 
     return {
         "shoot": shoot_dir,

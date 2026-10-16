@@ -40,10 +40,11 @@ import threading
 import time
 
 import requests
-from PIL import Image, ImageOps
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+
+from imageutil import IMG_EXTS, load_image
 
 
 # Windows-safe console: force UTF-8 with a lossy fallback so non-ASCII filenames
@@ -53,6 +54,15 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+
+# Wall-clock start, used by log() so long runs never look "stuck".
+_T0 = time.time()
+
+
+def log(msg, indent=2):
+    """Print a timestamped, flushed progress line."""
+    print(f"{' ' * indent}[{time.time() - _T0:6.1f}s] {msg}", flush=True)
 
 
 CATEGORIES = ["Portrait", "Traditional/Festival", "White Background", "Others"]
@@ -135,15 +145,21 @@ def resolve_key(arg_key, provider):
 # Image -> data
 # --------------------------------------------------------------------------- #
 def image_to_data_url(path, max_side=SEND_MAX):
-    """Load, transpose by EXIF orientation, downscale, base64-encode as JPEG."""
-    with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        w, h = im.size
-        scale = min(1.0, max_side / max(w, h))
-        if scale < 1.0:
-            im = im.resize((int(w * scale), int(h * scale)))
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=80)
+    """Load (raster or RAW), orient, downscale, base64-encode as JPEG.
+
+    Uses imageutil.load_image so Canon RAW (.cr3/.cr2) and other RAW files are
+    handled the same as JPEG/PNG.
+    """
+    im = load_image(path)
+    if im is None:
+        raise ValueError(f"could not load image: {path}")
+    im = im.convert("RGB")
+    w, h = im.size
+    scale = min(1.0, max_side / max(w, h))
+    if scale < 1.0:
+        im = im.resize((int(w * scale), int(h * scale)))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=80)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -298,9 +314,9 @@ def main():
 
     by_edit = {r["edit_file"]: r for r in rows}
     edits = [f for f in sorted(os.listdir(args.edit_dir))
-             if f.lower().endswith((".jpg", ".jpeg", ".png")) and f in by_edit]
+             if os.path.splitext(f)[1].lower() in IMG_EXTS and f in by_edit]
 
-    print(f"Classifying {len(edits)} edit(s) with {provider} ({model}) ...")
+    print(f"Classifying {len(edits)} edit(s) with {provider} ({model}) ...", flush=True)
 
     cache_path = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".", "labels_cache.json")
     cache = {}
@@ -310,12 +326,22 @@ def main():
         except Exception:
             cache = {}
 
+    n_cached = sum(1 for f in edits if f in cache and cache[f][0] not in ("ERROR",))
+    n_todo = len(edits) - n_cached
+    if n_cached:
+        log(f"{n_cached} already cached, {n_todo} to classify "
+            f"({args.workers} worker(s))")
+    if n_todo == 0:
+        log("nothing to do — all labels cached; writing outputs ...")
+
     lock = threading.Lock()
     results = {}
     done = [0]
 
     def work(fname):
         if fname in cache and cache[fname][0] not in ("ERROR",):
+            with lock:
+                done[0] += 1
             return fname, tuple(cache[fname])
         try:
             b64 = image_to_data_url(os.path.join(args.edit_dir, fname))
@@ -324,21 +350,39 @@ def main():
             cat, cap = "ERROR", f"({e})"
         with lock:
             done[0] += 1
-            print(f"  [{done[0]}/{len(edits)}] {fname}: {cat}")
+            print(f"  [{done[0]}/{len(edits)}] {fname}: {cat} "
+                  f"({time.time() - _T0:.0f}s)", flush=True)
         return fname, (cat, cap)
 
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for fname, res in ex.map(work, edits):
-            results[fname] = res
+    # Heartbeat: while API requests are in flight (they can take many seconds
+    # each) print a periodic "still working" line so the run never looks stuck.
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.wait(15):
+            with lock:
+                log(f"  ... still working: {done[0]}/{len(edits)} done, "
+                    f"waiting on API responses ...")
+
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
+    try:
+        with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
+            for fname, res in ex.map(work, edits):
+                results[fname] = res
+    finally:
+        stop.set()
 
     with lock:
         for fname, res in results.items():
             cache[fname] = list(res)
         json.dump(cache, open(cache_path, "w", encoding="utf-8"), indent=0)
+    log(f"labels cached: {len(cache)} total")
 
     order = {c: i for i, c in enumerate(CATEGORIES)}
     sorted_edits = sorted(results, key=lambda f: (order.get(results[f][0], 99), f))
 
+    log(f"writing Excel ({len(sorted_edits)} row(s)) -> {args.out} ...")
     # ---- write Excel (clean: no debug columns) ----------------------------- #
     wb = Workbook()
     ws = wb.active
@@ -377,6 +421,7 @@ def main():
     # ---- write debug log (match diagnostics for troubleshooting) ---------- #
     log_path = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".",
                             "categorize_debug.log")
+    log(f"writing debug log -> {log_path} ...")
     with open(log_path, "w", newline="", encoding="utf-8") as lf:
         lw = csv.writer(lf)
         lw.writerow(["group_id", "edit_file", "matched_original", "category",
@@ -391,12 +436,12 @@ def main():
 
     from collections import Counter
     counts = Counter(results[f][0] for f in results)
-    print("\n=== Category counts ===")
+    print("\n=== Category counts ===", flush=True)
     for c in CATEGORIES:
-        print(f"  {c:22s}: {counts.get(c, 0)}")
+        print(f"  {c:22s}: {counts.get(c, 0)}", flush=True)
     if counts.get("ERROR"):
-        print(f"  {'ERROR':22s}: {counts['ERROR']}")
-    print(f"\nExcel written: {args.out}")
+        print(f"  {'ERROR':22s}: {counts['ERROR']}", flush=True)
+    print(f"\nExcel written: {args.out}", flush=True)
 
 
 if __name__ == "__main__":

@@ -58,12 +58,33 @@ On the sample shoot (`_sort images`, 1,799 originals + 159 edits):
 
 - Python 3
 - Pillow, numpy, imagehash, openpyxl, requests
+- **rawpy** — *optional*, only needed to read Canon RAW (`.cr3`, `.cr2`) and
+  other RAW formats. Without it the pipeline still runs on JPEG/PNG/TIFF/WEBP/
+  BMP and any RAW files are simply skipped (with a one-time warning).
 
 Install everything at once (`python` on Windows, `python3` on macOS):
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+
+### Supported image formats
+
+| Kind | Extensions | Decoder |
+|---|---|---|
+| Raster | `.jpg .jpeg .png .tif .tiff .webp .bmp` | Pillow |
+| Canon RAW | `.cr3 .cr2 .crw` | rawpy (libraw) |
+| Other RAW | `.nef .arw .raf .orf .rw2 .dng .pef .srw .raw …` | rawpy (libraw) |
+
+> **CR3 support:** Canon CR3 is a BMFF/HEIF-based RAW format that Pillow cannot
+> decode. The tool now reads CR3 (and CR2 and other RAW formats) via **rawpy**,
+> for both matching (`sort_photos.py`) and captioning (`categorize.py`). RAW
+> files are decoded at half resolution — full detail is not needed for hashing
+> or the 640 px vision payload. If `rawpy` is not installed, RAW files are
+> skipped with a warning rather than crashing the run.
+>
+> RAW/CR3 files can appear in **either** the originals folder or (less commonly)
+> the edits folder — both are handled.
 
 ---
 
@@ -125,6 +146,55 @@ delegate to the same `run.py`, so behaviour is identical across platforms.
 
 > You can also **double-click `run.bat`** in File Explorer — it runs with the
 > default shoot and pauses at the end so you can read the output.
+
+### Windows PowerShell
+
+Everything works the same in **PowerShell** (the default terminal in VS Code on
+Windows). Two small differences vs `cmd.exe`:
+
+- Prefix a script in the current folder with `.\` — PowerShell does not run
+  local executables from the current directory unless you do.
+- Quote paths that contain spaces (e.g. `"_sort images"`), same as `cmd`.
+
+```powershell
+# from the project folder
+.\run.bat                                   # default shoot "_sort images"
+.\run.bat "input_folder"                    # every shoot inside it
+.\run.bat "input_folder" "my_output"        # batch + custom output base
+.\run.bat "input_folder" --provider openai  # use OpenAI for captions
+
+# or call Python directly (same behaviour as run.bat)
+python run.py "input_folder"
+python run.py "input_folder" --provider openai --model gpt-4o
+
+# the individual steps, if you prefer
+python sort_photos.py --shoot "input_folder" --out "sorted_output"
+python categorize.py --edit-dir "input_folder/Edit" --report "sorted_output/report.csv" --out "sorted_output/photos.xlsx"
+```
+
+If PowerShell blocks `.\run.bat` with a script-execution message, that is the
+**Execution Policy**, not the tool. Either run it through `cmd` instead:
+
+```powershell
+cmd /c run.bat "input_folder"
+```
+
+or unblock for the current session only:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+> Installing dependencies and opening results are identical in PowerShell:
+> `python -m pip install -r requirements.txt` and
+> `start "input_folder\_out\photos.xlsx"`.
+
+| Task | cmd.exe | PowerShell |
+|---|---|---|
+| Run the pipeline | `run.bat "input_folder"` | `.\run.bat "input_folder"` |
+| Call Python directly | `python run.py "input_folder"` | `python run.py "input_folder"` |
+| Install deps | `python -m pip install -r requirements.txt` | `python -m pip install -r requirements.txt` |
+| Open the Excel | `start ...\photos.xlsx` | `start ...\photos.xlsx` |
 
 ---
 
@@ -232,6 +302,24 @@ untouched.
 - Larger shoots stay cheap: reading EXIF is milliseconds per file, and the
   visual (MSE/pHash) stages run only on the small uncertain subset — never on
   every image. No per-image or cloud charges at any scale.
+
+### Progress logging
+
+Both steps print **timestamped, line-flushed** progress so a long run never
+looks stuck (useful for big shoots or slow API responses):
+
+```
+  [   0.0s] reading capture time from 20 original(s) ...
+  [   1.2s]   originals read: 20/20
+  [   1.2s] indexed 20 distinct capture time(s)
+  [   1.2s] matching 7 edit(s) to originals ...
+  [   1.3s] copying 7 matched group(s) into 'input_folder/match' ...
+```
+
+`categorize.py` prints a per-image line with elapsed seconds, and — while API
+requests are in flight — a **heartbeat every 15 s** (`... still working: N/M
+done ...`). A fully-cached run states `nothing to do — all labels cached`
+instead of silently finishing.
 
 ---
 

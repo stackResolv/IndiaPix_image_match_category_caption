@@ -45,7 +45,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def run(cmd):
-    print("$ " + " ".join(cmd))
+    print("$ " + " ".join(cmd), flush=True)
     env = dict(os.environ)
     # Force child scripts to use UTF-8 for files + console (Python 3.7+).
     env["PYTHONUTF8"] = "1"
@@ -112,18 +112,18 @@ def main():
             out = os.path.join(shoot, "_out")
         edit_dir = os.path.join(shoot, args.edits_name)
 
-        print()
-        print("=" * 66)
-        print(f" {os.path.basename(shoot)} -> {out}")
-        print("=" * 66)
-        print(" Step 1/2: matching edits to originals")
+        print(flush=True)
+        print("=" * 66, flush=True)
+        print(f" {os.path.basename(shoot)} -> {out}", flush=True)
+        print("=" * 66, flush=True)
+        print(" Step 1/2: matching edits to originals", flush=True)
         run([sys.executable, "sort_photos.py",
              "--shoot", shoot, "--out", out,
              "--originals-name", args.originals_name,
              "--edits-name", args.edits_name])
 
-        print()
-        print(f" Step 2/2: categorizing + captioning edits  (provider: {args.provider})")
+        print(flush=True)
+        print(f" Step 2/2: categorizing + captioning edits  (provider: {args.provider})", flush=True)
         cat_cmd = [sys.executable, "categorize.py",
                    "--edit-dir", edit_dir,
                    "--report", os.path.join(out, "report.csv"),
@@ -133,15 +133,15 @@ def main():
             cat_cmd += ["--model", args.model]
         run(cat_cmd)
 
-    print()
-    print("Done. Results:")
+    print(flush=True)
+    print("Done. Results:", flush=True)
     for shoot in shoots:
-        print(f"  {os.path.basename(shoot)}:")
-        print(f"    Match : {os.path.join(shoot, 'match')}  (all matched pairs, flat)")
+        print(f"  {os.path.basename(shoot)}:", flush=True)
+        print(f"    Match : {os.path.join(shoot, 'match')}  (all matched pairs, flat)", flush=True)
         out = (os.path.join(args.out, os.path.basename(shoot)) if batch else args.out) \
             if args.out else os.path.join(shoot, "_out")
-        print(f"    Excel : {os.path.join(out, 'photos.xlsx')}")
-        print(f"    Report: {os.path.join(out, 'report.csv')}")
+        print(f"    Excel : {os.path.join(out, 'photos.xlsx')}", flush=True)
+        print(f"    Report: {os.path.join(out, 'report.csv')}", flush=True)
 
 
 if __name__ == "__main__":

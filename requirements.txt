@@ -3,3 +3,7 @@ numpy
 imagehash
 openpyxl
 requests
+
+# Optional: enables Canon RAW (.cr3/.cr2) and other RAW formats.
+# Without it, JPEG/PNG/TIFF/WEBP still work; RAW files are just skipped.
+rawpy
