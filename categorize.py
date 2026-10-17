@@ -49,11 +49,11 @@ from imageutil import IMG_EXTS, load_image
 
 # Windows-safe console: force UTF-8 with a lossy fallback so non-ASCII filenames
 # or captions never crash printing on a cp1252 console.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+from consoleutil import hr, safe, setup_console, term_width, wrap
+
+# Console prep: UTF-8 where possible, and the real width so the narration fits
+# a narrow Windows PowerShell window instead of wrapping into nonsense.
+setup_console()
 
 
 # Wall-clock start, used by log() so long runs never look "stuck".
@@ -61,8 +61,29 @@ _T0 = time.time()
 
 
 def log(msg, indent=2):
-    """Print a timestamped, flushed progress line."""
-    print(f"{' ' * indent}[{time.time() - _T0:6.1f}s] {msg}", flush=True)
+    """Print a timestamped progress line, wrapped to the terminal width."""
+    stamp = f"[{time.time() - _T0:6.1f}s] "
+    text = safe(str(msg))
+    lines = wrap(text, indent=indent + len(stamp), subsequent_indent=" " * 4)
+    print(" " * indent + stamp + lines[0], flush=True)
+    for extra in lines[1:]:
+        print(" " * (indent + len(stamp)) + extra.strip(), flush=True)
+
+
+def step(n, text, total=5):
+    """Announce a pipeline step so the log reads as a story, not just numbers."""
+    print(flush=True)
+    print("  " + hr("-"), flush=True)
+    for line in wrap(safe(f"Step {n}/{total}: {text}"),
+                     indent=2, subsequent_indent=" " * 4):
+        print("  " + line, flush=True)
+    print("  " + hr("-"), flush=True)
+
+
+def note(text):
+    """A plain explanatory line, wrapped and indented under the current step."""
+    for line in wrap(safe(text), indent=4, subsequent_indent=" " * 4):
+        print(" " * 4 + line, flush=True)
 
 
 CATEGORIES = ["Portrait", "Traditional/Festival", "White Background", "Others"]
@@ -316,7 +337,24 @@ def main():
     edits = [f for f in sorted(os.listdir(args.edit_dir))
              if os.path.splitext(f)[1].lower() in IMG_EXTS and f in by_edit]
 
-    print(f"Classifying {len(edits)} edit(s) with {provider} ({model}) ...", flush=True)
+    step(1, "loading the match report from step 1")
+    note(f"report : {args.report}")
+    note(f"edits  : {args.edit_dir}")
+    note(f"rows   : {len(rows)} in report, {len(edits)} edit file(s) to label")
+    dropped = len(by_edit) - len(edits)
+    if dropped:
+        note(f"note   : {dropped} report row(s) have no matching file in the "
+             f"edits folder (or are not images) - they are skipped")
+    if not edits:
+        sys.exit("error: no edits to classify - is --edit-dir pointing at the "
+                 "folder named in report.csv?")
+
+    step(2, f"preparing the vision model ({provider})")
+    note(f"model   : {model}")
+    note(f"workers : {args.workers} image(s) in flight at once")
+    note("what    : each edit is downscaled to 640 px, sent to the model, and "
+         "returns a category + one-line caption as JSON.")
+    note("cost    : roughly $0.001-0.002 per edit with this model.")
 
     cache_path = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".", "labels_cache.json")
     cache = {}
@@ -328,11 +366,13 @@ def main():
 
     n_cached = sum(1 for f in edits if f in cache and cache[f][0] not in ("ERROR",))
     n_todo = len(edits) - n_cached
-    if n_cached:
-        log(f"{n_cached} already cached, {n_todo} to classify "
-            f"({args.workers} worker(s))")
+    step(3, "checking the cache so you never pay twice for the same image")
+    note(f"cache   : {cache_path}")
+    if args.no_cache:
+        note("--no-cache given: every label will be recomputed")
+    note(f"result  : {n_cached} already labelled, {n_todo} still to classify")
     if n_todo == 0:
-        log("nothing to do — all labels cached; writing outputs ...")
+        note("nothing to do - all labels cached; writing outputs ...")
 
     lock = threading.Lock()
     results = {}
@@ -350,8 +390,18 @@ def main():
             cat, cap = "ERROR", f"({e})"
         with lock:
             done[0] += 1
-            print(f"  [{done[0]}/{len(edits)}] {fname}: {cat} "
-                  f"({time.time() - _T0:.0f}s)", flush=True)
+            pct = 100.0 * done[0] / len(edits)
+            elapsed = time.time() - _T0
+            rate = done[0] / elapsed if elapsed > 0 else 0.0
+            eta = (len(edits) - done[0]) / rate if rate > 0 else 0.0
+            tail = f", ~{eta:.0f}s left" if done[0] < len(edits) else ""
+            print(safe(f"  [{done[0]}/{len(edits)}] {fname}"), flush=True)
+            for i, line in enumerate(wrap(
+                    safe(f"-> {cat} | {cap or '(no caption)'}"),
+                    indent=12, subsequent_indent=" " * 4)):
+                print(" " * 8 + ("-> " if i == 0 else "   ") + line, flush=True)
+            print(safe(f"        ({pct:.0f}% done, {elapsed:.0f}s{tail})"),
+                  flush=True)
         return fname, (cat, cap)
 
     # Heartbeat: while API requests are in flight (they can take many seconds
@@ -361,17 +411,23 @@ def main():
     def heartbeat():
         while not stop.wait(15):
             with lock:
-                log(f"  ... still working: {done[0]}/{len(edits)} done, "
-                    f"waiting on API responses ...")
+                left = len(edits) - done[0]
+                log(f"  ... still working: {done[0]}/{len(edits)} labelled, "
+                    f"{left} to go - waiting on API responses ...")
 
+    step(4, f"classifying {n_todo} edit(s) with the vision model")
+    note("each result is cached immediately, so an interrupted run resumes "
+         "where it stopped instead of paying for the same image again.")
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
+    t_classify = time.time()
     try:
         with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
             for fname, res in ex.map(work, edits):
                 results[fname] = res
     finally:
         stop.set()
+    log(f"  classification finished in {time.time() - t_classify:.1f}s")
 
     with lock:
         for fname, res in results.items():
@@ -382,7 +438,9 @@ def main():
     order = {c: i for i, c in enumerate(CATEGORIES)}
     sorted_edits = sorted(results, key=lambda f: (order.get(results[f][0], 99), f))
 
-    log(f"writing Excel ({len(sorted_edits)} row(s)) -> {args.out} ...")
+    step(5, "writing the Excel workbook and the debug log")
+    note("rows are grouped by category so similar photos sit together")
+    note(f"excel   : {args.out}  ({len(sorted_edits)} row(s))")
     # ---- write Excel (clean: no debug columns) ----------------------------- #
     wb = Workbook()
     ws = wb.active
@@ -432,16 +490,19 @@ def main():
             lw.writerow([r.get("group_id", ""), fname, r.get("matched_original", ""),
                          cat, r.get("method", ""), r.get("confidence", ""),
                          r.get("distance", ""), r.get("burst_margin", ""), cap])
-    print(f"Debug log written: {log_path}")
+    print(safe(f"Debug log written: {log_path}"))
 
     from collections import Counter
     counts = Counter(results[f][0] for f in results)
-    print("\n=== Category counts ===", flush=True)
+    print(flush=True)
+    print("  " + hr("-"), flush=True)
+    print(safe("  RESULT - categories assigned"), flush=True)
     for c in CATEGORIES:
-        print(f"  {c:22s}: {counts.get(c, 0)}", flush=True)
+        print(safe(f"    {c:22s}: {counts.get(c, 0)}"), flush=True)
     if counts.get("ERROR"):
-        print(f"  {'ERROR':22s}: {counts['ERROR']}", flush=True)
-    print(f"\nExcel written: {args.out}", flush=True)
+        print(safe(f"    {'ERROR':22s}: {counts['ERROR']}"), flush=True)
+    print("  " + hr("-"), flush=True)
+    print(safe(f"  open this: {args.out}"), flush=True)
 
 
 if __name__ == "__main__":

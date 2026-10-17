@@ -216,12 +216,58 @@ def _parse_tiff_ifds(buf, base, want=_TIFF_DT_TAGS):
     return None
 
 
-def _embedded_tiff_time(path, scan_bytes=1 << 20):
+_TIFF_SIGS = (b"II*\x00", b"MM\x00*")
+
+# First pass scans this much for a TIFF header (fast path). Canon CR3 keeps its
+# metadata inside a 'CMT1' box in the moov box, which can sit well past the
+# start of the file, so anything not found here triggers a full-file scan
+# before we ever resort to the slow rawpy container parser.
+_QUICK_SCAN = 1 << 20          # 1 MiB
+_CMT1_LOOKAHEAD = 1 << 16      # 64 KiB after a CMT1 box
+
+
+def _find_tiff_base(mm, size):
+    """Locate the best TIFF/Exif header offset inside an mmap'd file.
+
+    Prefers the header that follows a Canon CR3 ``CMT1`` box (that box *is* the
+    Exif payload), then falls back to the earliest header found anywhere in the
+    file. All searching happens in C via ``mmap.find``; no image is decoded.
+    """
+    # 1) Cheap scan of the head of the file.
+    head = min(size, _QUICK_SCAN)
+    base = -1
+    for sig in _TIFF_SIGS:
+        i = mm.find(sig, 0, head)
+        if i != -1 and (base == -1 or i < base):
+            base = i
+    if base != -1:
+        return base
+
+    # 2) CR3: metadata lives in a 'CMT1' box — jump straight after it.
+    cmt = mm.find(b"CMT1", 0)
+    if cmt != -1:
+        end = min(size, cmt + _CMT1_LOOKAHEAD)
+        for sig in _TIFF_SIGS:
+            i = mm.find(sig, cmt, end)
+            if i != -1:
+                return i
+
+    # 3) Last resort: scan the whole file (still C-speed, never decodes).
+    base = -1
+    for sig in _TIFF_SIGS:
+        i = mm.find(sig, 0)
+        if i != -1 and (base == -1 or i < base):
+            base = i
+    return base
+
+
+def _embedded_tiff_time(path):
     """Read date/time from the TIFF/Exif block embedded in a RAW file.
 
-    Canon CR3 (and many other RAW formats) embed a standard TIFF header near the
-    start of the file. We memory-map the file, locate that header, and parse its
-    IFDs — far cheaper than decoding the image.
+    Canon CR3 (and many other RAW formats) embed a standard TIFF/Exif structure
+    in the file. We memory-map it, locate that header, and parse its IFDs — a
+    few hundred microseconds per file, versus seconds for ``rawpy.imread``,
+    which has to open and parse the whole RAW container.
     """
     import mmap
     try:
@@ -240,42 +286,66 @@ def _embedded_tiff_time(path, scan_bytes=1 << 20):
         except Exception:
             return None
         with mm:
-            region = bytes(mm[:min(size, scan_bytes)])
-            base = -1
-            for sig in (b"II*\x00", b"MM\x00*"):
-                i = region.find(sig)
-                if i != -1 and (base == -1 or i < base):
-                    base = i
-            if base == -1:
+            try:
+                base = _find_tiff_base(mm, size)
+                if base == -1:
+                    return None
+                return _parse_tiff_ifds(mm, base)
+            except Exception:
                 return None
-            return _parse_tiff_ifds(mm, base)
 
 
 def _raw_capture_time(path):
     """Capture timestamp string from a RAW file, or None.
 
-    Tries rawpy's own EXIF parser first (older builds), then parses the embedded
-    TIFF/Exif block directly (works for Canon CR3 with current rawpy).
+    Order matters for speed. Parsing the embedded TIFF/Exif block is a mmap
+    plus a few struct unpacks (sub-millisecond). ``rawpy`` instead opens and
+    parses the whole RAW container, which can take seconds per file — across a
+    4,000-file shoot that is the difference between seconds and many minutes,
+    and it is exactly what makes the progress counter look frozen. So: cheap
+    path first, rawpy only as a fallback for files we cannot parse directly.
     """
-    t = _rawpy_exif_time(path)
+    t = _embedded_tiff_time(path)
     if t:
         return t
-    return _embedded_tiff_time(path)
+    return _rawpy_exif_time(path)
 
 
-def capture_time(path):
+def capture_time(path, fast=False):
     """Best-effort capture timestamp (DateTimeOriginal/DateTime) or None.
 
     Works for both ordinary raster files (via Pillow EXIF) and RAW files
     (via rawpy/libraw EXIF).
+
+    ``fast=True`` skips the rawpy container parser. That parser can sit for
+    seconds on a damaged or exotic file, and when you are indexing 4,000 files
+    one such file stalls the whole run. In fast mode a RAW file only gets the
+    bounded mmap/TIFF scan (microseconds), and anything unparseable simply
+    yields None — it can still be matched later via perceptual hashing.
     """
     ext = os.path.splitext(path)[1].lower()
 
     if ext in RAW_EXTS:
-        t = _raw_capture_time(path)
+        t = _embedded_tiff_time(path)
+        if t is None and not fast:
+            t = _rawpy_exif_time(path)
         if t:
             return t
-        # fall through: some RAW files are actually readable by Pillow (e.g. DNG)
+        # Some RAW files are really TIFF underneath (e.g. DNG) — Pillow can read
+        # their Exif without any RAW decoding.
+        try:
+            with Image.open(path) as im:
+                exif = im.getexif()
+                try:
+                    ifd = exif.get_ifd(0x8769)
+                except Exception:
+                    ifd = {}
+                dto = ifd.get(36867) or ifd.get(36868) or exif.get(306)
+                if dto:
+                    return str(dto)
+        except Exception:
+            pass
+        return None
 
     try:
         with Image.open(path) as im:

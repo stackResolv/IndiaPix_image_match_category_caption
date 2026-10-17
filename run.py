@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 run.py — cross-platform one-command runner for the photo pipeline.
-Works on Windows, macOS and Linux (uses only Python, no shell scripting).
+Works identically on Windows (cmd / PowerShell), macOS and Linux.
 
 Usage:
     python run.py                                  # default: shoot "_sort images"
@@ -20,7 +20,7 @@ and/or an edits sub-folder (default "Edit").
 
 Runs both steps per shoot:
     1. sort_photos.py  -> matches each edit with its original, builds <shoot>/match
-    2. categorize.py   -> adds category + caption, writes Excel
+    2. categorize.py   -> classifies + captions each edit, writes photos.xlsx
 
 Output per shoot (unless a custom output is given):
     <shoot>/match/            matched pairs (flat)
@@ -28,29 +28,48 @@ Output per shoot (unless a custom output is given):
 """
 
 import argparse
+import os
 import subprocess
 import sys
-import os
+import time
 from pathlib import Path
 
-# Windows-safe console: force UTF-8 with a lossy fallback so non-ASCII paths or
-# filenames never crash printing on a cp1252 console.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+from consoleutil import hr, safe, setup_console, term_width, wrap
+
+# Console prep: UTF-8 where possible, and the real width so the narration fits
+# a narrow Windows PowerShell / cmd window instead of wrapping into nonsense.
+setup_console()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+_MAIN_T0 = time.time()
+
+
+def say(text, indent=0, hanging=None):
+    """Print wrapped, encoding-safe text, indented under the current section.
+
+    ``hanging`` controls how far continuation lines are indented relative to
+    the first; two spaces keeps a bullet's continuation visually attached.
+    """
+    for line in wrap(safe(text), indent=indent,
+                    subsequent_indent=hanging if hanging is not None else "  "):
+        print(" " * indent + line, flush=True)
+
+
+def rule(char="-"):
+    print(hr(char), flush=True)
 
 
 def run(cmd):
-    print("$ " + " ".join(cmd), flush=True)
+    """Run a child step, echoing the command and how long it took."""
+    say("$ " + " ".join(cmd))
     env = dict(os.environ)
     # Force child scripts to use UTF-8 for files + console (Python 3.7+).
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("PIPELINE_WIDTH", str(term_width()))
+    t0 = time.time()
     subprocess.check_call(cmd, cwd=HERE, env=env)
+    say(f"(this step took {time.time() - t0:.1f}s)")
 
 
 def looks_like_shoot(path, originals_name, edits_name):
@@ -103,9 +122,29 @@ def main():
     shoots = detect_shoots(args.input, args.originals_name, args.edits_name)
     batch = len(shoots) > 1
 
-    print(f"Processing {len(shoots)} shoot(s) from '{args.input}'")
+    print(flush=True)
+    rule("=")
+    say("PHOTO PIPELINE")
+    rule("=")
+    say(f"input         : {args.input}")
+    say(f"shoot(s)      : {len(shoots)}"
+        + ("  (batch - each shoot is processed in turn)" if batch else ""))
+    say(f"originals dir : {args.originals_name}    edits dir : {args.edits_name}")
+    say(f"provider      : {args.provider}")
+    if os.name == "nt":
+        say(f"platform      : Windows  (console width {term_width()} columns)")
+    else:
+        say(f"platform      : {sys.platform}  (console width {term_width()} columns)")
+    print(flush=True)
+    say("What will happen, per shoot:")
+    say("1. sort_photos.py - read capture timestamps, match every edit to the "
+        "original it came from, copy each pair into <shoot>/match/, and write "
+        "report.csv describing how each match was made.", indent=2)
+    say("2. categorize.py  - send each edit to the vision model, get a category "
+        "+ caption, and write photos.xlsx.", indent=2)
+    say("Nothing in your source folders is moved, renamed or deleted.", indent=2)
 
-    for shoot in shoots:
+    for shoot_idx, shoot in enumerate(shoots, 1):
         if args.out:
             out = os.path.join(args.out, os.path.basename(shoot)) if batch else args.out
         else:
@@ -113,17 +152,25 @@ def main():
         edit_dir = os.path.join(shoot, args.edits_name)
 
         print(flush=True)
-        print("=" * 66, flush=True)
-        print(f" {os.path.basename(shoot)} -> {out}", flush=True)
-        print("=" * 66, flush=True)
-        print(" Step 1/2: matching edits to originals", flush=True)
+        rule("#")
+        say(f"SHOOT {shoot_idx}/{len(shoots)}: {os.path.basename(shoot)}")
+        say(f"output -> {out}")
+        rule("#")
+        print(flush=True)
+
+        say("Step 1/2: match each edit to its original")
+        say("reads timestamps (free), falls back to pixel/hash comparison only "
+            "where needed; copies pairs into the shoot's match/ folder.", indent=2)
         run([sys.executable, "sort_photos.py",
              "--shoot", shoot, "--out", out,
              "--originals-name", args.originals_name,
              "--edits-name", args.edits_name])
 
         print(flush=True)
-        print(f" Step 2/2: categorizing + captioning edits  (provider: {args.provider})", flush=True)
+        say("Step 2/2: categorise + caption each edit")
+        say(f"sends each edit to the vision model (provider: {args.provider}); "
+            "results are cached, so a re-run never pays for the same image twice.",
+            indent=2)
         cat_cmd = [sys.executable, "categorize.py",
                    "--edit-dir", edit_dir,
                    "--report", os.path.join(out, "report.csv"),
@@ -134,14 +181,23 @@ def main():
         run(cat_cmd)
 
     print(flush=True)
-    print("Done. Results:", flush=True)
+    rule("=")
+    say(f"DONE - {len(shoots)} shoot(s) processed in {time.time() - _MAIN_T0:.1f}s")
+    rule("=")
+    say("What to open:")
     for shoot in shoots:
-        print(f"  {os.path.basename(shoot)}:", flush=True)
-        print(f"    Match : {os.path.join(shoot, 'match')}  (all matched pairs, flat)", flush=True)
         out = (os.path.join(args.out, os.path.basename(shoot)) if batch else args.out) \
             if args.out else os.path.join(shoot, "_out")
-        print(f"    Excel : {os.path.join(out, 'photos.xlsx')}", flush=True)
-        print(f"    Report: {os.path.join(out, 'report.csv')}", flush=True)
+        say(f"{os.path.basename(shoot)}:", indent=2)
+        say("photos.xlsx  - categories + captions (start here)", indent=4)
+        say(os.path.join(out, "photos.xlsx"), indent=6)
+        say("report.csv   - how each edit was matched to its original", indent=4)
+        say(os.path.join(out, "report.csv"), indent=6)
+        say("match/       - the matched pairs, side by side", indent=4)
+        say(os.path.join(shoot, "match"), indent=6)
+    print(flush=True)
+    say("If any rows look wrong, check 'confidence' in report.csv - values of "
+        "0.3, or method=unmatched, are the ones worth eyeballing first.")
 
 
 if __name__ == "__main__":

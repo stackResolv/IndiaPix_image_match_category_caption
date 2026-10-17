@@ -19,6 +19,16 @@ set -e
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
+# Let the caller pin the wrap width when piping into a log viewer that reports
+# no width (e.g. `./run.sh ... | tee run.log`). Leave unset for auto-detect.
+if [ -t 1 ] && [ -z "${PIPELINE_WIDTH:-}" ] && command -v tput >/dev/null 2>&1; then
+    cols=$(tput cols 2>/dev/null || echo "")
+    case "$cols" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$cols" -ge 40 ] && export PIPELINE_WIDTH="$cols" ;;
+    esac
+fi
+
 # Prefer python3, fall back to python.
 if command -v python3 >/dev/null 2>&1; then
     PY=python3

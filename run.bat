@@ -23,6 +23,12 @@ chcp 65001 >nul 2>&1
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
+REM --- Tell Python how many columns this window has --------------------------
+REM A default cmd window is 80 wide. Without this, run.py would guess and the
+REM step banners / explanations would wrap badly. Remove the next line to let
+REM Python detect the width itself (it falls back to 80 if unsure).
+if not defined PIPELINE_WIDTH set "PIPELINE_WIDTH=100"
+
 REM --- Locate a Python interpreter (prefer the py launcher if present) --------
 set "PYTHON="
 where py >nul 2>&1 && set "PYTHON=py -3"
