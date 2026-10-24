@@ -16,6 +16,7 @@ workflows keep working with no extra dependencies.
 """
 
 import os
+import re
 import sys
 
 from PIL import Image, ImageOps
@@ -115,6 +116,7 @@ def load_image(path):
 # DateTimeOriginal (36867), DateTimeDigitized (36868), DateTime (306)
 _TIFF_DT_TAGS = (36867, 36868, 306)
 _TIFF_EXIF_PTR = 0x8769
+_TIFF_INTEROP_PTR = 0xA005
 
 
 def _rawpy_exif_time(path):
@@ -146,32 +148,33 @@ def _rawpy_exif_time(path):
     return None
 
 
-def _parse_tiff_ifds(buf, base, want=_TIFF_DT_TAGS):
-    """Parse a TIFF/Exif structure starting at ``base`` in ``buf``.
+def _parse_tiff_tags(buf, base, want):
+    """Return ``{tag: value}`` read from a TIFF/Exif structure at ``base``.
 
-    ``buf`` may be bytes or mmap. Returns the first of the ``want`` date tags
-    found (as a string) or None. Handles little/big endian and follows the
-    Exif sub-IFD pointer (0x8769).
+    ``buf`` may be bytes or mmap. Handles little/big endian, follows both the
+    Exif sub-IFD pointer (0x8769) and the Interoperability pointer (0xA005), and
+    returns text tags as stripped strings plus integer tags as ``int``.
     """
     import struct
     n = len(buf)
     if base < 0 or base + 8 > n:
-        return None
+        return {}
     endian = buf[base:base + 2]
     if endian == b"II":
         e = "<"
     elif endian == b"MM":
         e = ">"
     else:
-        return None
+        return {}
     try:
         if struct.unpack(e + "H", buf[base + 2:base + 4])[0] != 42:
-            return None
+            return {}
         ifd_off = struct.unpack(e + "I", buf[base + 4:base + 8])[0]
     except Exception:
-        return None
+        return {}
 
     type_size = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
+    want = set(want)
     found = {}
     visited = set()
 
@@ -195,9 +198,15 @@ def _parse_tiff_ifds(buf, base, want=_TIFF_DT_TAGS):
                 valpos = base + struct.unpack(e + "I", buf[ent + 8:ent + 12])[0]
             if tag in want and tag not in found:
                 if 0 <= valpos and valpos + size <= n:
-                    raw = bytes(buf[valpos:valpos + size])
-                    found[tag] = raw.rstrip(b"\x00").decode("ascii", "replace").strip()
-            elif tag == _TIFF_EXIF_PTR:
+                    if typ == 3 and count == 1:          # SHORT
+                        found[tag] = struct.unpack(e + "H", buf[valpos:valpos + 2])[0]
+                    elif typ == 4 and count == 1:        # LONG
+                        found[tag] = struct.unpack(e + "I", buf[valpos:valpos + 4])[0]
+                    else:                                # ASCII and the rest
+                        raw = bytes(buf[valpos:valpos + size])
+                        found[tag] = raw.rstrip(b"\x00").decode(
+                            "ascii", "replace").strip()
+            elif tag in (_TIFF_EXIF_PTR, _TIFF_INTEROP_PTR):
                 sub = struct.unpack(e + "I", buf[ent + 8:ent + 12])[0]
                 read_ifd(sub)
         nxt_pos = base + off + 2 + cnt * 12
@@ -210,9 +219,15 @@ def _parse_tiff_ifds(buf, base, want=_TIFF_DT_TAGS):
                 read_ifd(nxt)
 
     read_ifd(ifd_off)
+    return found
+
+
+def _parse_tiff_ifds(buf, base, want=_TIFF_DT_TAGS):
+    """First of the ``want`` date tags present, as a string, or None."""
+    found = _parse_tiff_tags(buf, base, want)
     for tag in want:
         if found.get(tag):
-            return found[tag]
+            return str(found[tag])
     return None
 
 
@@ -364,3 +379,219 @@ def capture_time(path, fast=False):
     except Exception:
         return None
     return None
+
+
+def modified_time(path):
+    """Best-effort 'when was this file produced' timestamp, or None.
+
+    Editing software (Photoshop, Lightroom, Capture One) preserves
+    ``DateTimeOriginal`` but rewrites ``DateTime`` (tag 306). So for a
+    *derivative* the ``DateTime`` tag is the day it was edited, while for a
+    camera original both stamps are identical.
+
+    Order: EXIF ``DateTime`` (tag 306), else the filesystem mtime. RAW
+    containers cannot be opened by Pillow, so tag 306 is read from the embedded
+    TIFF block with the same mmap scanner capture_time uses.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in RAW_EXTS:
+        return _raw_tag_value(path, 306) or _file_date(path) or None
+    try:
+        with Image.open(path) as im:
+            dt = im.getexif().get(306)  # DateTime - rewritten by editors
+            if dt:
+                return str(dt)
+    except Exception:
+        pass
+    return _file_date(path) or None
+
+
+# --------------------------------------------------------------------------- #
+# Deliverable metadata (file format / resolution / colour space / size / date)
+# --------------------------------------------------------------------------- #
+# Pillow spells some formats differently from how a photo library labels them.
+_FORMAT_ALIASES = {"JPG": "JPEG", "TIF": "TIFF", "MPO": "JPEG"}
+
+# Exif tag 40961 (ColorSpace): 1 = sRGB, 65535 = uncalibrated.
+_TAG_COLOR_SPACE = 40961
+
+_MODE_COLOR_SPACE = {
+    "1": "Grayscale", "L": "Grayscale", "LA": "Grayscale", "I": "Grayscale",
+    "I;16": "Grayscale", "F": "Grayscale",
+    "RGB": "sRGB", "RGBA": "sRGB", "RGBX": "sRGB",
+    "CMYK": "CMYK", "YCbCr": "sRGB", "LAB": "Lab",
+}
+
+
+def _normalise_format(fmt):
+    """Normalise a Pillow/extension format name to a library-style label."""
+    if not fmt:
+        return ""
+    f = str(fmt).upper().lstrip(".")
+    return _FORMAT_ALIASES.get(f, f)
+
+
+def _icc_color_space(im):
+    """Colour space from the embedded ICC profile, if it names one."""
+    try:
+        icc = im.info.get("icc_profile") or b""
+    except Exception:
+        return ""
+    if not icc:
+        return ""
+    low = icc.lower()
+    if b"adobe rgb" in low or b"adobergb" in low:
+        return "Adobe RGB"
+    if b"prophoto" in low:
+        return "ProPhoto RGB"
+    if b"srgb" in low:
+        return "sRGB"
+    return ""
+
+
+def _exif_color_space(exif):
+    """Colour space from Exif tag 40961 (blank when uncalibrated/absent)."""
+    try:
+        v = exif.get(_TAG_COLOR_SPACE)
+    except Exception:
+        return ""
+    if v == 1:
+        return "sRGB"
+    return ""
+
+
+def _iso_date(value):
+    """'2025:03:14 10:22:01' -> '2025-03-14' (or '' if unparseable)."""
+    if not value:
+        return ""
+    s = str(value).strip()
+    m = re.match(r"^(\d{4})[:\-/](\d{2})[:\-/](\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return ""
+
+
+def _file_date(path):
+    """Fallback date from the filesystem (local time), ISO formatted."""
+    try:
+        import datetime
+        return datetime.date.fromtimestamp(os.path.getmtime(path)).isoformat()
+    except Exception:
+        return ""
+
+
+def _file_size_mb(path):
+    """File size in MiB, one decimal."""
+    try:
+        return round(os.path.getsize(path) / (1024 * 1024), 1)
+    except Exception:
+        return ""
+
+
+def _raw_tag_value(path, tag):
+    """Read one Exif tag from a RAW container's embedded TIFF block, or None.
+
+    Uses the same mmap/TIFF scanner as capture_time, so it never decodes the
+    image (a few hundred microseconds per file).
+    """
+    import mmap
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        return None
+    if size <= 0:
+        return None
+    try:
+        f = open(path, "rb")
+    except Exception:
+        return None
+    with f:
+        try:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except Exception:
+            return None
+        with mm:
+            try:
+                base = _find_tiff_base(mm, size)
+                if base == -1:
+                    return None
+                return _parse_tiff_tags(mm, base, (tag,)).get(tag)
+            except Exception:
+                return None
+
+
+def _raw_color_space(path):
+    """Colour space of a RAW file, read from its embedded Exif block.
+
+    RAW containers cannot be opened by Pillow, so this reads tag 40961
+    (ColorSpace) directly. 65535 (uncalibrated) or a missing tag means the file
+    does not state a colour space - the cell is left blank rather than claiming
+    sRGB.
+    """
+    return "sRGB" if _raw_tag_value(path, _TAG_COLOR_SPACE) == 1 else ""
+
+
+def _raw_dimensions(path):
+    """Full post-processed pixel dimensions of a RAW file, or (None, None).
+
+    Reads the RAW container header only (no full decode), so this stays cheap.
+    """
+    if rawpy is None:
+        return None, None
+    try:
+        with rawpy.imread(path) as raw:
+            s = raw.sizes
+            w = getattr(s, "iwidth", 0) or getattr(s, "width", 0)
+            h = getattr(s, "iheight", 0) or getattr(s, "height", 0)
+            return (int(w) or None), (int(h) or None)
+    except Exception:
+        return None, None
+
+
+def image_metadata(path, prefer_modified=False):
+    """Deliverable metadata for one image file.
+
+    Returns a dict with the keys used by the IndiaPix metadata template:
+    ``file_format``, ``resolution``, ``color_space``, ``file_size_mb`` and
+    ``date_created``. Missing/unreadable values come back as empty strings so a
+    bad file never breaks a batch run.
+
+    ``prefer_modified=True`` uses the *edit* timestamp (EXIF ``DateTime``, else
+    file mtime) instead of the capture timestamp. That is what the template's
+    ``date_created`` shows for a delivered derivative, while the original row
+    keeps the capture date (e.g. 2025-03-14 vs 2026-09-02).
+    """
+    meta = {
+        "file_format": "",
+        "resolution": "",
+        "color_space": "",
+        "file_size_mb": _file_size_mb(path),
+        "date_created": "",
+    }
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in RAW_EXTS:
+        meta["file_format"] = _normalise_format(ext)
+        w, h = _raw_dimensions(path)
+        if w and h:
+            meta["resolution"] = f"{w}x{h}"
+        meta["color_space"] = _raw_color_space(path)
+        stamp = modified_time(path) if prefer_modified else capture_time(path)
+        meta["date_created"] = _iso_date(stamp) or _file_date(path)
+        return meta
+
+    try:
+        with Image.open(path) as im:
+            meta["file_format"] = _normalise_format(im.format or ext)
+            w, h = im.size
+            meta["resolution"] = f"{w}x{h}"
+            meta["color_space"] = (_icc_color_space(im)
+                                   or _exif_color_space(im.getexif())
+                                   or _MODE_COLOR_SPACE.get((im.mode or "").upper(), ""))
+    except Exception:
+        meta["file_format"] = _normalise_format(ext)
+
+    if not meta["date_created"]:
+        stamp = modified_time(path) if prefer_modified else capture_time(path)
+        meta["date_created"] = _iso_date(stamp) or _file_date(path)
+    return meta

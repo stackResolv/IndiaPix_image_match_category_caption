@@ -173,6 +173,7 @@ def main():
             indent=2)
         cat_cmd = [sys.executable, "categorize.py",
                    "--edit-dir", edit_dir,
+                   "--originals-dir", os.path.join(shoot, args.originals_name),
                    "--report", os.path.join(out, "report.csv"),
                    "--out", os.path.join(out, "photos.xlsx"),
                    "--provider", args.provider]

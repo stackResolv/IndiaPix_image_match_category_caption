@@ -15,6 +15,11 @@
 
 set -e
 
+# Always run from the folder this script lives in: run.py resolves relative
+# paths (e.g. "input_folder") against the current directory, so a run started
+# from elsewhere would look for the shoot in the wrong place.
+cd "$(dirname "$0")" || exit 1
+
 # Force UTF-8 for the console and for any child Python processes.
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8

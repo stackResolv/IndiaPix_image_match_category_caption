@@ -18,6 +18,14 @@ REM ===========================================================================
 
 setlocal enableextensions
 
+REM --- Always run from the folder this .bat lives in -------------------------
+REM run.py resolves relative paths (e.g. "input_folder", "input_folder/JPEG")
+REM against the current directory, so without this a run started from another
+REM folder - or via a full path - would look for run.py and the shoot in the
+REM wrong place. %~dp0 is this .bat's own directory, trailing backslash
+REM included; /d also switches drive when the project is on another one.
+cd /d "%~dp0"
+
 REM --- Force the console to UTF-8 so non-ASCII filenames never crash ----------
 chcp 65001 >nul 2>&1
 set "PYTHONUTF8=1"
@@ -43,7 +51,10 @@ if not defined PYTHON (
 )
 
 REM --- Run the pipeline (all arguments are forwarded as-is) -------------------
-%PYTHON% run.py %*
+REM %* keeps the user's quoting intact, so paths with spaces work whether the
+REM call came from cmd.exe, PowerShell, or Explorer. The quoted script path is
+REM safe even if the project folder itself contains spaces.
+%PYTHON% "%~dp0run.py" %*
 if errorlevel 1 goto :error
 
 echo.
