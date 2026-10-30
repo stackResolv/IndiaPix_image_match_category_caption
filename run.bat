@@ -3,17 +3,25 @@ REM ===========================================================================
 REM run.bat - Windows one-command runner for the photo matching + categorizing
 REM           pipeline. Mirrors run.py so the same commands work on Windows.
 REM
-REM Usage (run from the project folder):
+REM Usage:
 REM   run.bat                              (default shoot "_sort images")
-REM   run.bat "input_folder"               (every shoot inside it)
+REM   run.bat "E:\path\to\batch"           (or drag a folder onto this .bat)
+REM   run.bat "input_folder"               (every shoot inside it, any depth)
 REM   run.bat "MyShoot" "my_output"        (single shoot + custom output)
 REM   run.bat "input_folder" "my_output"   (batch + custom output base)
 REM   run.bat "input_folder" --provider openai                 (use OpenAI for captions)
 REM   run.bat "input_folder" --provider openai --model gpt-4o  (override the model)
+REM   run.bat "input_folder" --dry-run     (pair the sets, write report.csv, no API)
 REM
-REM Delegates to run.py (all arguments are forwarded verbatim via %*), which
-REM detects whether the path is a single shoot or a parent folder of shoots,
-REM then runs both steps: sort_photos.py + categorize.py.
+REM Two input layouts are handled automatically - no flag needed:
+REM   SHOOT      somewhere under the path there is a "JPEG" and/or "Edit" folder.
+REM              Photos are matched to their originals by capture timestamp.
+REM   SETS       photos but NO "JPEG"/"Edit" folders anywhere (one folder per
+REM              set, e.g. ...\lense correction\INDIAPIX_BATCH_001\SET_000001\)
+REM              Each photo's role is read from its own metadata instead.
+REM
+REM Delegates to run.py (all arguments forwarded verbatim via %*). Any nesting
+REM depth is searched, so a deeply nested client delivery just works.
 REM ===========================================================================
 
 setlocal enableextensions

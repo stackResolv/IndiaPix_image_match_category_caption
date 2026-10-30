@@ -7,6 +7,12 @@
     is identical; this one exists because PowerShell is the default terminal in
     VS Code on Windows and some people never open cmd.exe.
 
+    Two input layouts are handled automatically, at any nesting depth:
+      SHOOT - a "JPEG" and/or "Edit" folder exists somewhere under the path;
+              edits are matched to originals by capture timestamp.
+      SETS  - photos but no JPEG/Edit folders (one folder per set); each
+              photo's role is read from its own metadata instead.
+
     What it fixes for PowerShell specifically:
       * Execution policy — run.bat is often blocked, this is a .ps1 you can run
         with a one-time -ExecutionPolicy Bypass (see below).

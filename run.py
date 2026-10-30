@@ -104,64 +104,91 @@ def _holds_photos(path):
     return False
 
 
+def _walk_has_photos(path, max_depth=12):
+    """True if any photo file lives under `path`, at any sensible depth.
+
+    Deep on purpose: a client may nest their delivery several levels
+    (``.../lense correction/INDIAPIX_BATCH_001/SET_000001/*.jpg``) and the layout
+    must still be recognised. Our own output folders (``_out``) are skipped.
+    """
+    base = str(path).rstrip(os.sep)
+    base_depth = base.count(os.sep)
+    for root, dirs, files in os.walk(base):
+        depth = root.rstrip(os.sep).count(os.sep) - base_depth
+        dirs[:] = sorted(d for d in dirs if not d.startswith("_") and
+                         d.lower() not in ("match", "__macosx", ".git"))
+        if depth >= max_depth:
+            dirs[:] = []
+        for f in files:
+            if os.path.splitext(f)[1].lower() in _PHOTO_EXTS:
+                return True
+    return False
+
+
+def _find_shoot_dirs(path, originals_name, edits_name, max_depth=8):
+    """Every folder at any depth that holds a JPEG/Edit sub-folder.
+
+    Checking only the immediate children is not enough: a shoot can sit inside a
+    dated or per-client folder (``.../2024_02_05/INDIAPIX_BATCH_001/JPEG``).
+    """
+    found = []
+    base = str(path).rstrip(os.sep)
+    base_depth = base.count(os.sep)
+    for root, dirs, files in os.walk(base):
+        depth = root.rstrip(os.sep).count(os.sep) - base_depth
+        dirs[:] = sorted(d for d in dirs if not d.startswith("_") and
+                         d.lower() not in ("__macosx", ".git"))
+        if depth >= max_depth:
+            dirs[:] = []
+        if originals_name in dirs or edits_name in dirs:
+            found.append(root)
+            dirs[:] = []          # a shoot's own children are not shoots
+    return found
+
+
 def detect_layout(path, originals_name, edits_name):
     """Work out how the input is organised: ``"shoot"`` or ``"sets"``.
 
-      shoot — the client sent an originals folder (`JPEG`) and/or an edits
-              folder (`Edit`). The original workflow: match every edit to its
-              original by capture timestamp, then categorise.
-      sets  — the client sent one folder per set, each holding the original and
-              its edit side by side, with no Original/Edit folders to say which
-              is which. Typical for 30,000-40,000 pairs; the roles are read from
-              the files themselves.
+      shoot — somewhere under this path is an originals folder (`JPEG`) and/or
+              an edits folder (`Edit`). The original workflow: match every edit
+              to its original by capture timestamp, then categorise.
+      sets  — there are photos but **no** Original/Edit folders anywhere, so the
+              delivery is one folder per set (original + edit side by side). The
+              role of each photo is then read from its own metadata.
 
-    Anything ambiguous falls back to ``"shoot"``, so existing inputs keep
-    behaving exactly as they did before.
+    The set-folder layout is the fallback whenever photos exist, which is what
+    makes a nested client tree (``.../<batch>/<SET_xxx>/``) work without any
+    flags and without demanding ``JPEG``/``Edit`` folders that are not there.
     """
     p = Path(path)
     if not p.is_dir():
         return "shoot"
+
+    # 1. This folder is itself a shoot.
     if looks_like_shoot(p, originals_name, edits_name):
         return "shoot"
-    if _holds_photos(p):
+    # 2. A shoot exists somewhere below (any depth).
+    if _find_shoot_dirs(path, originals_name, edits_name):
         return "shoot"
-    try:
-        children = [d for d in sorted(p.iterdir()) if d.is_dir()]
-    except OSError:
-        return "shoot"
-    if not children:
-        return "shoot"
-    if looks_like_shoot(children[0], originals_name, edits_name):
-        return "shoot"
-    if _holds_photos(children[0]):
+    # 3. Photos exist below but no shoot folders: one folder per set.
+    if _walk_has_photos(path):
         return "sets"
-    for child in children[:20]:
-        try:
-            nested = [d for d in sorted(child.iterdir()) if d.is_dir()]
-        except OSError:
-            continue
-        if nested and _holds_photos(nested[0]):
-            return "sets"
     return "shoot"
 
 
 def detect_shoots(path, originals_name, edits_name):
-    """Return a list of shoot folder paths (single shoot, or all sub-shoots)."""
+    """Every shoot folder under `path` (the path itself, or any descendant).
+
+    Returns ``[]`` when there is no shoot. The caller then falls back to the
+    set-folder pipeline instead of exiting: a plain tree of photo folders is a
+    valid input and must never produce "no shoot found".
+    """
     p = Path(path)
     if not p.is_dir():
         sys.exit(f"error: '{path}' is not a directory")
-
-    # The path itself is a shoot.
     if looks_like_shoot(p, originals_name, edits_name):
         return [str(p)]
-
-    # Otherwise treat it as a parent: each sub-folder that looks like a shoot.
-    shoots = [str(d) for d in sorted(p.iterdir())
-              if d.is_dir() and looks_like_shoot(d, originals_name, edits_name)]
-    if not shoots:
-        sys.exit(f"error: no shoot found in '{path}' "
-                 f"(expected sub-folders containing '{edits_name}' or '{originals_name}')")
-    return shoots
+    return _find_shoot_dirs(path, originals_name, edits_name)
 
 
 def main():
@@ -191,6 +218,15 @@ def main():
                          "report.csv, and stop before any API call")
     args = ap.parse_args()
 
+    # A path that does not exist is the one thing we cannot recover from, so
+    # say exactly what was tried rather than failing deeper down.
+    if not os.path.isdir(args.input):
+        sys.exit(f"error: '{args.input}' is not a folder.\n"
+                 f"       Pass the folder holding your photos (or the batch "
+                 f"folder that contains it).\n"
+                 f"       Tip: you can drag the folder onto run.bat instead of "
+                 f"typing the path.")
+
     # The client now sends two possible layouts. Detect which one this is, so
     # the same command works for both and no flag has to be remembered.
     layout = detect_layout(args.input, args.originals_name, args.edits_name)
@@ -199,6 +235,14 @@ def main():
         return
 
     shoots = detect_shoots(args.input, args.originals_name, args.edits_name)
+    if not shoots:
+        # No JPEG/Edit folders anywhere, but there are photos: this is the
+        # folder-per-set layout. Run that instead of erroring out.
+        print(flush=True)
+        say(f"note          : no '{args.originals_name}' / '{args.edits_name}' "
+            f"folders under this path - treating it as one folder per set.")
+        run_sets(args)
+        return
     batch = len(shoots) > 1
 
     print(flush=True)
