@@ -123,13 +123,50 @@ SEND_MAX = 640
 # Token budget: five fields, two of them descriptions plus a keyword list.
 MAX_TOKENS = 500
 
-# Operations the template uses in edit_operation. The model may still return
-# something outside this list; it is kept (sanitised) rather than dropped.
+# Operations used in edit_operation — the client's eight, exactly. Everything the
+# model says (and everything an older cache holds) is mapped onto this list by
+# canonical_op, so a cell never carries a term the client cannot filter on.
 EDIT_OPS = [
-    "crop", "resize", "straightening", "color_tonal", "retouch",
-    "object_removal", "object_addition", "background_replacement",
-    "sharpening", "vignette", "text_overlay",
+    "color_tonal",
+    "crop_perspective",
+    "white_balance",
+    "object_removal",
+    "sharpen_denoise",
+    "background",
+    "skin_portrait",
+    "compositing",
 ]
+
+# One line per operation, written for a vision model: what to LOOK FOR, not just
+# the label. This ships inside the prompt, which is why the eight are separable
+# from a single original/edit pair.
+_OP_GUIDE = (
+    "- color_tonal — the light or colour mood changed: brightness, exposure, "
+    "contrast, highlights/shadows, saturation, vibrance, curves, levels, colour "
+    "grading, split-toning, a LUT or a vignette. Framing and objects are the "
+    "same; the image simply looks brighter/darker/richer/flatter.\n"
+    "- crop_perspective — the frame itself changed: a tighter or looser crop, a "
+    "different aspect ratio, a straightened tilted horizon, a rotation, or "
+    "corrected converging/keystoned lines (a building that leaned now upright).\n"
+    "- white_balance — a colour-temperature or tint correction only: a blue/cool "
+    "cast removed, an orange/warm cast added, a yellow-green cast neutralised so "
+    "whites and greys read neutral. Contrast and saturation look unchanged.\n"
+    "- object_removal — something clearly visible in IMAGE 1 is GONE in IMAGE 2: "
+    "a person, animal, bin, cable, sign, dust spot or stray object has been made "
+    "to disappear and the area behind it rebuilt.\n"
+    "- sharpen_denoise — detail handling only: extra sharpening, clarity, "
+    "texture or micro-contrast, or the opposite — noise/grain reduction and "
+    "smoothing that removes speckle while keeping edges crisp.\n"
+    "- background — the background specifically is replaced, removed to white or "
+    "transparency, blurred, extended or swapped for a studio backdrop, while the "
+    "main subject keeps its shape and position.\n"
+    "- skin_portrait — portrait retouching on a person: skin smoothing, "
+    "blemish/spot healing, teeth whitening, eye brightening, under-eye or "
+    "stray-hair cleanup, jawline or figure slimming.\n"
+    "- compositing — two or more elements are combined into one image: an object "
+    "or person ADDED, a sky swapped, an element pasted in, a montage or double "
+    "exposure, or text/graphics/watermark overlaid.\n"
+)
 
 _CATEGORY_RULES = (
     "CATEGORY — choose exactly one. Apply this PRIORITY ORDER, first match wins:\n"
@@ -146,13 +183,15 @@ _CATEGORY_RULES = (
 )
 
 _TITLE_RULE = (
-    "TITLE — a short editorial title, 4 to 10 words, Title Case, comma-separated "
-    "phrases allowed, NO trailing period (e.g. \"Woman at spice market, "
-    "Jaipur\").\n\n"
+    "TITLE — a real, readable sentence of at most 7 or 8 words (never more). "
+    "Sentence case: capitalise only the first word and proper nouns "
+    "(e.g. \"Woman buying spices at a Jaipur market\"). It must read as a "
+    "sentence, not a keyword list — so no comma-separated fragments and NO "
+    "trailing period.\n\n"
 )
 
 _KEYWORDS_RULE = (
-    "KEYWORDS — 5 to 12 lowercase keywords (capitalise place and proper names, "
+    "KEYWORDS — 8 to 15 lowercase keywords (capitalise place and proper names, "
     "e.g. \"India\"), comma-separated with NO space after the commas, ordered "
     "from most to least specific. Include the place, the subject, the activity "
     "and the mood where relevant (e.g. \"market,spices,woman,India,street\"). "
@@ -177,10 +216,16 @@ PROMPT_PAIR = (
     "edit_operation — one or more operations, semicolon-separated, most "
     "important first, chosen ONLY from this vocabulary: " +
     "; ".join(EDIT_OPS) + ".\n"
-    "  Use \"none\" only if the two images are visually identical apart from "
-    "pixel dimensions. Rotation or a different aspect ratio counts as \"crop\"; "
-    "exposure, contrast, white balance or colour grading counts as \"color_tonal\"; "
-    "skin/dust/blemish cleanup counts as \"retouch\".\n\n"
+    "  What each one means — match what you SEE to these definitions, not just "
+    "the word:\n" + _OP_GUIDE +
+    "  Report EVERY operation you can actually see; most real edits are a "
+    "combination (e.g. \"color_tonal;skin_portrait\"). Use \"none\" only if the "
+    "two images are visually identical apart from pixel dimensions.\n"
+    "  Disambiguation, in order: if an object disappeared it is object_removal; "
+    "if the whole backdrop changed it is background; if a new element appeared "
+    "it is compositing; if only a person's skin/face was cleaned it is "
+    "skin_portrait; if only the colour cast shifted it is white_balance; if only "
+    "detail/noise changed it is sharpen_denoise.\n\n"
     "Return ONLY compact JSON and nothing else:\n"
     '{"category": "...", "title": "...", "keywords": "...", '
     '"original_description": "...", "final_description": "...", '
@@ -210,10 +255,13 @@ TEMPLATE_COLUMNS = [
     "resolution", "color_space", "file_size_mb", "date_created",
     "date_contributed", "asset_category", "ai_used",
 ]
+# `category` is the classifier's own 4 subject types (Portrait / Traditional /
+# White BG / Others), appended after the 17 template columns for review.
 EXTRA_COLUMNS = ["category"]
 
-# Longest keyword list we keep, so a chatty model cannot bloat a cell.
-MAX_KEYWORDS = 20
+# Longest keyword list we keep (the prompt asks for 8-15), so a chatty
+# model cannot bloat a cell.
+MAX_KEYWORDS = 15
 
 # Fractional aspect-ratio change that counts as a crop rather than a resize.
 CROP_AR_TOLERANCE = 0.02
@@ -362,6 +410,84 @@ def _clean_sentence(value):
     return t
 
 
+# Longest title we write. The prompt asks for 7-8 words; this is the hard cap so
+# a chatty answer cannot overflow the cell.
+MAX_TITLE_WORDS = 8
+
+# Words a truncated title must never end on: articles, conjunctions, prepositions
+# and bare possessives all leave the sentence hanging.
+_DANGLING_WORDS = {
+    "", "a", "an", "the", "and", "with", "of", "in", "at", "on", "for", "to",
+    "by", "or", "nor", "but", "as", "from", "into", "onto", "over", "under",
+    "near", "her", "his", "their", "its", "my", "our", "your", "this", "that",
+    "these", "those", "some", "any", "all",
+}
+
+# Words that keep a capital in sentence case: proper nouns and names that turn up
+# in photo-library titles. Everything else is lowercased unless it starts the
+# sentence.
+_PROPER_NOUNS = {
+    "india", "indian", "jaipur", "delhi", "mumbai", "kolkata", "chennai",
+    "bengaluru", "bangalore", "hyderabad", "goa", "kerala", "rajasthan",
+    "gujarat", "punjab", "tamil", "nadu", "uttar", "pradesh", "maharashtra",
+    "karnataka", "varanasi", "agra", "taj", "mahal", "himalaya", "himalayas",
+    "ganges", "ganga", "diwali", "holi", "eid", "christmas", "navratri",
+    "onam", "pongal", "durga", "puja", "sikh", "hindu", "muslim", "buddhist",
+    "jain", "punjabi", "marathi", "bengali", "rajasthani",
+    "iphone", "photoshop", "lightroom", "adobe",
+}
+
+
+def _normalise_title(value):
+    """A sentence of at most MAX_TITLE_WORDS words, in sentence case.
+
+    The prompt asks the model for this, but a model can always drift: this makes
+    it true in the cell regardless. Sentence case means "capitalise the first
+    word and proper nouns", so a title that arrives in Title Case is folded down
+    ("Woman At Spice Market, Jaipur" -> "Woman at spice market, Jaipur").
+    """
+    text = _clean_sentence(value)
+    if not text:
+        return ""
+
+    # Drop a trailing ellipsis/comma and collapse any doubled spaces.
+    text = text.rstrip(" ,;:-")
+
+    # Cap the length. Prefer cutting at a natural phrase boundary (a comma)
+    # within the cap, so the title reads as a whole phrase rather than a
+    # half-finished clause; fall back to a hard trim that never leaves a
+    # dangling comma or conjunction.
+    words = text.split()
+    if len(words) > MAX_TITLE_WORDS:
+        head = words[:MAX_TITLE_WORDS]
+        cut = None
+        for i in range(len(head) - 1, 3, -1):      # keep at least 4 words
+            if head[i].endswith(","):
+                cut = i
+                break
+        if cut:
+            words = head[:cut]
+        else:
+            words = head
+            while words and words[-1].strip(",;:-").lower() in _DANGLING_WORDS:
+                words.pop()
+        text = " ".join(words).rstrip(" ,;:-")
+
+    # Sentence case. A word keeps its capital when it starts the title, is a
+    # known proper noun, or carries an inner capital (iPhone, McLeod).
+    out = []
+    for i, w in enumerate(text.split()):
+        core = w.strip(".,;:!?\"'()")
+        keep = (i == 0
+                or core.lower() in _PROPER_NOUNS
+                or any(c.isupper() for c in core[1:]))
+        if keep:
+            out.append(w[:1].upper() + w[1:] if w else w)
+        else:
+            out.append(w.lower())
+    return " ".join(out)
+
+
 def _normalise_keywords(value):
     """Return a clean 'a,b,c' keyword string, no spaces after the commas.
 
@@ -387,20 +513,173 @@ def _normalise_keywords(value):
     return ",".join(out)
 
 
-def _normalise_ops(value):
-    """Return 'op_a;op_b' using the template's semicolon style."""
+# Every synonym/sloppy term we have seen (or that the previous vocabulary used)
+# mapped onto the client's eight. Longest phrases first, so "object removal"
+# is matched before the bare word "object".
+_OP_ALIASES = {
+    # colour / tone
+    "color_tonal": [
+        "color_tonal", "colour_tonal", "color", "colour", "tonal", "tone",
+        "color_grade", "colour_grade", "color_grading", "colour_grading",
+        "grade", "grading", "lut", "vignette", "exposure", "brightness",
+        "contrast", "saturation", "vibrance", "curves", "levels",
+        "highlights", "shadows", "black_and_white", "black_white",
+        "bw", "b&w", "monochrome", "sepia", "hdr", "film_look", "matte",
+        "clarity_color", "cinematic_grade", "color_tonal_correction",
+        "colour_tonal_correction",
+    ],
+    # framing / geometry
+    "crop_perspective": [
+        "crop_perspective", "crop", "cropped", "cropping", "perspective",
+        "perspective_correction", "straightening", "straighten", "straightened",
+        "rotation", "rotate", "rotated", "resize", "resized", "reframe",
+        "reframing", "aspect_ratio", "keystone", "keystoning", "lens_correction",
+        "lense_correction", "lense", "lens", "distortion", "tilt", "horizon",
+    ],
+    # colour cast only
+    "white_balance": [
+        "white_balance", "whitebalance", "wb", "color_cast", "colour_cast",
+        "color_temperature", "colour_temperature", "temperature", "tint",
+        "warmth", "cool_cast", "warm_cast", "neutralise", "neutralize",
+        "white_balence", "white_balancing",
+    ],
+    # something disappeared
+    "object_removal": [
+        "object_removal", "object_removed", "remove_object", "removal",
+        "remove", "removed", "erase", "erased", "erasing", "cleanup",
+        "clean_up", "spot_removal", "spot_healing", "healing", "heal",
+        "clone", "cloning", "clone_stamp", "content_aware", "inpainting",
+        "dust_removal", "dust", "blemish_removal", "object_removeal",
+    ],
+    # detail only
+    "sharpen_denoise": [
+        "sharpen_denoise", "sharpen", "sharpening", "sharpened", "denoise",
+        "denoising", "denoize", "noise_reduction", "noise", "grain",
+        "grain_reduction",
+        "texture", "detail_enhancement", "unsharp_mask", "micro_contrast",
+        "smoothing", "smooth",
+    ],
+    # the backdrop changed
+    "background": [
+        "background", "background_replacement", "background_replaced",
+        "background_removal", "background_removed", "background_change",
+        "background_blur", "background_swap", "bg", "backdrop", "backdrop_change",
+        "cutout", "cut_out", "masking", "subject_isolation", "white_backdrop",
+        "transparent_background", "remove_background", "replace_background",
+    ],
+    # skin / face only
+    "skin_portrait": [
+        "skin_portrait", "retouch", "retouching", "retouched", "skin",
+        "skin_smoothing", "skin_retouch", "portrait_retouch", "beauty",
+        "beauty_retouch", "facial_retouch", "face_retouch", "blemish",
+        "blemish_removal_skin", "teeth_whitening", "eye_brightening",
+        "eye_enhancement", "figure_slimming", "body_reshape", "liquify",
+        "makeup", "hair_cleanup",
+    ],
+    # two things combined / something added
+    "compositing": [
+        "compositing", "composite", "composed", "montage", "collage",
+        "object_addition", "object_added", "add_object", "addition", "added",
+        "sky_replacement", "sky_replaced", "sky_swap", "element_added",
+        "pasted", "paste", "double_exposure", "text_overlay", "text",
+        "watermark", "graphic_overlay", "logo_overlay",
+    ],
+}
+
+# phrase -> canonical op, longest phrase first (so multi-word matches win).
+_OP_LOOKUP = sorted(
+    ((alias, op) for op, aliases in _OP_ALIASES.items() for alias in aliases),
+    key=lambda kv: -len(kv[0]),
+)
+
+# Canonical order for output: fixed, so two runs of the same pair produce
+# byte-identical cells and a spreadsheet filter is stable.
+_OP_ORDER = {op: i for i, op in enumerate(EDIT_OPS)}
+
+
+def canonical_op(term):
+    """Map any operation term onto one of the eight, or '' if unrecognisable.
+
+    Matching is on the normalised term (lowercase, single underscores) and tries
+    the longest known phrase first, so "object_removal" is not mistaken for a
+    generic "remove" and "background_removal" is not read as "object_removal".
+    """
+    k = _clean_text(term).lower().strip(" .;")
+    k = k.replace("-", "_").replace(" ", "_")
+    while "__" in k:
+        k = k.replace("__", "_")
+    if not k or k in ("none", "no_change", "n_a", "na", "unchanged", "nil"):
+        return ""
+    if k in _OP_ORDER:
+        return k
+    for alias, op in _OP_LOOKUP:
+        if k == alias:
+            return op
+    # Substring fallback for phrases like "colour grading and retouch".
+    for alias, op in _OP_LOOKUP:
+        if len(alias) >= 4 and alias in k:
+            return op
+    return ""
+
+
+def _op_parts(value):
+    """Split a model answer into operation terms, whatever separator it used."""
     if isinstance(value, (list, tuple)):
-        parts = [str(v) for v in value]
-    else:
-        parts = str(value or "").replace(",", ";").split(";")
+        return [str(v) for v in value]
+    # Models answer with every separator going: "crop, colour grade",
+    # "crop; colour grade", "crop and colour grade", "crop + colour grade".
+    text = str(value or "")
+    for sep in (",", ";", " and ", " & ", " + ", " plus "):
+        text = text.replace(sep, ";")
+    return text.split(";")
+
+
+def _normalise_ops(value):
+    """Return 'op_a;op_b' using the template's semicolon style.
+
+    Every term is mapped onto the client's eight operations (synonyms included),
+    de-duplicated, and emitted in the fixed EDIT_OPS order so a pair always
+    produces the same cell. Unknown terms are dropped rather than written,
+    because the client can only filter on the eight.
+    """
+    found = set()
+    for p in _op_parts(value):
+        op = canonical_op(p)
+        if op:
+            found.add(op)
+    return ";".join(sorted(found, key=lambda o: _OP_ORDER.get(o, 99)))
+
+
+def ops_ordered(value):
+    """The operations named by `value`, in the order it stated them.
+
+    ``_normalise_ops`` re-sorts onto the fixed EDIT_OPS order so a single cell is
+    stable across runs. When several sources are merged — the operation folder
+    the client filed the batch under, then the model's answer — the ORDER is the
+    information (primary first, then by confidence), so this keeps the caller's
+    order and only canonicalises the individual terms.
+    """
     out = []
-    for p in parts:
-        k = _clean_text(p).lower().strip(" .;")
-        k = k.replace("-", "_").replace(" ", "_")
-        if not k or k == "none" or k in out:
-            continue
-        out.append(k)
-    return ";".join(out)
+    for p in _op_parts(value):
+        op = canonical_op(p)
+        if op and op not in out:
+            out.append(op)
+    return out
+
+
+def dominant_op(value):
+    """The FIRST (most important) operation in the model's own answer.
+
+    The prompt asks for the operations most-important-first, so the first term
+    is the one to file the image under. `_normalise_ops` re-sorts for a stable
+    cell, which loses that ordering — so the dominant value is captured here,
+    before sorting.
+    """
+    for p in _op_parts(value):
+        op = canonical_op(p)
+        if op:
+            return op
+    return ""
 
 
 def _error_label(msg=""):
@@ -445,42 +724,58 @@ def _normalise(data, has_original=True):
         cat = "Others"
     final_desc = _clean_sentence(data.get("final_description")
                                  or data.get("description"))
+    ops = _normalise_ops(data.get("edit_operation")) if has_original else ""
     return {
         "category": cat,
-        "title": _clean_sentence(data.get("title")),
+        "title": _normalise_title(data.get("title")),
         "keywords": _normalise_keywords(data.get("keywords")),
         "original_description": (_clean_sentence(data.get("original_description"))
                                  if has_original else ""),
         "final_description": final_desc,
-        "edit_operation": (_normalise_ops(data.get("edit_operation"))
-                           if has_original else ""),
+        "edit_operation": ops,
     }
 
 
-def add_geometry_ops(ops, orig_meta, edit_meta):
-    """Append 'crop' when the two images really do have a different aspect ratio.
+def geometry_ops(orig_meta, edit_meta):
+    """Operations the file metadata proves, as a list — currently a real crop.
 
-    Orientation is ignored (a portrait derivative of a landscape original is a
-    resize, not a crop), and a plain resolution change never adds 'resize' —
-    that is already obvious from the file_size_mb / resolution columns.
+    Independent of what the model saw: if the two files have a materially
+    different aspect ratio, something was cropped or the frame was reshaped.
     """
     try:
         ow, oh = (int(v) for v in str(orig_meta.get("resolution", "")).split("x"))
         ew, eh = (int(v) for v in str(edit_meta.get("resolution", "")).split("x"))
     except Exception:
-        return ops
+        return []
     if min(ow, oh) <= 0 or min(ew, eh) <= 0:
-        return ops
+        return []
     o_small, o_big = sorted((ow, oh))
     e_small, e_big = sorted((ew, eh))
     ar_o = o_big / o_small
     ar_e = e_big / e_small
     if abs(ar_o - ar_e) / ar_o > CROP_AR_TOLERANCE:
-        parts = ops.split(";") if ops else []
-        if "crop" not in parts:
-            parts.append("crop")
-        return ";".join(parts)
-    return ops
+        return ["crop_perspective"]
+    return []
+
+
+def add_geometry_ops(ops, orig_meta, edit_meta):
+    """Append 'crop_perspective' when the aspect ratio genuinely changed.
+
+    This is a *measured* signal, independent of what the model saw: if the two
+    files have a materially different aspect ratio, something was cropped or the
+    frame was reshaped, whether or not the model mentioned it.
+
+    Orientation is ignored (a portrait derivative of a landscape original is a
+    resize, not a crop), and a plain resolution change never adds anything —
+    that is already obvious from the file_size_mb / resolution columns.
+    """
+    if not geometry_ops(orig_meta, edit_meta):
+        return ops
+    parts = [p for p in (ops.split(";") if ops else []) if p]
+    if "crop_perspective" not in parts:
+        parts.append("crop_perspective")
+    # Keep the fixed canonical order so the cell is stable across runs.
+    return ";".join(sorted(parts, key=lambda o: _OP_ORDER.get(o, 99)))
 
 
 # --------------------------------------------------------------------------- #
@@ -720,9 +1015,11 @@ def main():
          "can name the real difference (crop, colour grade, retouching, ...).")
     note("cost    : roughly $0.001-0.002 per edit with this model.")
 
-    # v3 cache: dicts that include the original-vs-final comparison fields.
+    # v6 cache: v5 predates the 7-8 word sentence title, so its titles would
+    # arrive in Title Case and far too long. Keeping the name in step with the
+    # prompt shape means a stale cache is ignored, not silently mixed in.
     cache_path = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".",
-                              "labels_cache_v3.json")
+                              "labels_cache_v6.json")
     cache = {}
     if not args.no_cache and os.path.isfile(cache_path):
         try:
@@ -967,8 +1264,9 @@ def main():
         lw = csv.writer(lf)
         lw.writerow(["group_id", "edit_file", "matched_original", "category",
                      "method", "confidence", "distance", "burst_margin",
-                     "original_found", "edit_operation", "title",
-                     "original_description", "final_description", "keywords"])
+                     "original_found", "edit_operation",
+                     "title", "original_description", "final_description",
+                     "keywords"])
         for fname in sorted_edits:
             label = results[fname]
             r = by_edit[fname]
@@ -999,7 +1297,8 @@ def main():
                f"({len(set_order)} set(s) + {n_singles} single edit(s)) "
                f"x {len(all_columns)} columns "
                f"({len(TEMPLATE_COLUMNS)} template + "
-               f"{len(EXTRA_COLUMNS)} extra)"), flush=True)
+               f"{len(EXTRA_COLUMNS)} extra: {', '.join(EXTRA_COLUMNS)})"),
+          flush=True)
     print(safe(f"  open this    : {args.out}"), flush=True)
 
 

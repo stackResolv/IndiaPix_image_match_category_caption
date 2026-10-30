@@ -409,8 +409,11 @@ def modified_time(path):
 # --------------------------------------------------------------------------- #
 # Deliverable metadata (file format / resolution / colour space / size / date)
 # --------------------------------------------------------------------------- #
-# Pillow spells some formats differently from how a photo library labels them.
-_FORMAT_ALIASES = {"JPG": "JPEG", "TIF": "TIFF", "MPO": "JPEG"}
+# file_format is taken from the FILENAME, not from Pillow. The client's sheet
+# must say what the file is called on disk: "photo.jpg" -> jpg, "IMG_0001.CR3"
+# -> cr3. Pillow would say "JPEG"/"MPO"/"TIFF" instead, and for a RAW it cannot
+# open the file at all - so the extension is the one answer that is always both
+# available and correct.
 
 # Exif tag 40961 (ColorSpace): 1 = sRGB, 65535 = uncalibrated.
 _TAG_COLOR_SPACE = 40961
@@ -423,12 +426,23 @@ _MODE_COLOR_SPACE = {
 }
 
 
-def _normalise_format(fmt):
-    """Normalise a Pillow/extension format name to a library-style label."""
-    if not fmt:
+def _normalise_format(value):
+    """The filename extension, lowercase and without the dot.
+
+    ``photo.jpg`` -> ``jpg``, ``IMG_0001.CR3`` -> ``cr3``, ``scan.tiff`` ->
+    ``tiff``. A full path or filename is accepted too (the extension is taken
+    from it), so a call site can pass either the extension or the whole name.
+    An empty/absent value yields ``""``, leaving the cell blank rather than
+    inventing a format.
+    """
+    if not value:
         return ""
-    f = str(fmt).upper().lstrip(".")
-    return _FORMAT_ALIASES.get(f, f)
+    s = str(value).strip()
+    # Take the LAST extension whatever was passed: ".jpg", "photo.jpg",
+    # "path/to/pic.PNG" and "a.b.jpeg" all collapse to the final suffix. A bare
+    # extension (".cr3") has no stem, so splitext yields nothing - strip the dot.
+    suffix = os.path.splitext(s)[1] or s
+    return suffix.lstrip(".").lower()
 
 
 def _icc_color_space(im):
@@ -536,16 +550,27 @@ def _raw_dimensions(path):
 
     Reads the RAW container header only (no full decode), so this stays cheap.
     """
-    if rawpy is None:
-        return None, None
+    if rawpy is not None:
+        try:
+            with rawpy.imread(path) as raw:
+                s = raw.sizes
+                w = getattr(s, "iwidth", 0) or getattr(s, "width", 0)
+                h = getattr(s, "iheight", 0) or getattr(s, "height", 0)
+                if w and h:
+                    return int(w), int(h)
+        except Exception:
+            pass
+    # Fallback: several RAW formats are TIFF containers, so Pillow can report
+    # their size with no RAW decoding. Without this, a machine with no rawpy
+    # would leave `resolution` blank for every RAW original.
     try:
-        with rawpy.imread(path) as raw:
-            s = raw.sizes
-            w = getattr(s, "iwidth", 0) or getattr(s, "width", 0)
-            h = getattr(s, "iheight", 0) or getattr(s, "height", 0)
-            return (int(w) or None), (int(h) or None)
+        with Image.open(path) as im:
+            w, h = im.size
+            if w and h:
+                return int(w), int(h)
     except Exception:
-        return None, None
+        pass
+    return None, None
 
 
 def image_metadata(path, prefer_modified=False):
@@ -580,18 +605,177 @@ def image_metadata(path, prefer_modified=False):
         meta["date_created"] = _iso_date(stamp) or _file_date(path)
         return meta
 
+    # From the filename, always - even though Pillow is open on the file. The
+    # sheet must say what the file is called (jpg/tif/png), not Pillow's label
+    # for the encoder that happened to write it (JPEG/TIFF/MPO).
+    meta["file_format"] = _normalise_format(ext)
     try:
         with Image.open(path) as im:
-            meta["file_format"] = _normalise_format(im.format or ext)
             w, h = im.size
             meta["resolution"] = f"{w}x{h}"
             meta["color_space"] = (_icc_color_space(im)
                                    or _exif_color_space(im.getexif())
                                    or _MODE_COLOR_SPACE.get((im.mode or "").upper(), ""))
     except Exception:
-        meta["file_format"] = _normalise_format(ext)
+        pass
 
     if not meta["date_created"]:
         stamp = modified_time(path) if prefer_modified else capture_time(path)
         meta["date_created"] = _iso_date(stamp) or _file_date(path)
     return meta
+
+
+# --------------------------------------------------------------------------- #
+# One-pass probe for the set-folder workflow (one folder = one shot)
+# --------------------------------------------------------------------------- #
+# A "set" folder holds the camera original and its edit side by side, with no
+# Original/Edit sub-folders to say which is which. The edit is normally written
+# by Photoshop/Lightroom/etc., so the EXIF Software tag (305) is the single most
+# reliable tell; the others (name, pixel area, byte size, edit date) are weaker
+# corroboration. Name matching is only ever a hint.
+
+_EDITOR_SOFTWARE = (
+    "photoshop", "lightroom", "capture one", "captureone", "gimp", "affinity",
+    "dxo", "topaz", "paint shop", "paintshop", "pixlr", "canva", "snapseed",
+    "facetune", "luminar", "acdsee", "darktable", "rawtherapee", "on1",
+    "photoroom", "picsart", "meitu", "vsco",
+)
+
+_TAG_SOFTWARE = 305
+
+
+def editor_software(value):
+    """True if an EXIF ``Software`` value names a known photo editor."""
+    v = str(value or "").strip().lower()
+    return bool(v) and any(k in v for k in _EDITOR_SOFTWARE)
+
+
+def _mtime_epoch(path):
+    """Filesystem mtime as epoch seconds, or 0.0."""
+    try:
+        return os.path.getmtime(path)
+    except Exception:
+        return 0.0
+
+
+def _dt_epoch(value):
+    """'2025:03:14 10:22:01' -> epoch seconds (local), or 0.0."""
+    if not value:
+        return 0.0
+    s = str(value).strip()
+    m = re.match(r"^(\d{4})[:\-/](\d{2})[:\-/](\d{2})[ T](\d{2}):(\d{2}):(\d{2})", s)
+    try:
+        if m:
+            import datetime
+            return datetime.datetime(*[int(g) for g in m.groups()]).timestamp()
+        m = re.match(r"^(\d{4})[:\-/](\d{2})[:\-/](\d{2})$", s)
+        if m:
+            import datetime
+            return datetime.datetime(int(m.group(1)), int(m.group(2)),
+                                     int(m.group(3))).timestamp()
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def inspect_image(path):
+    """Everything the set-folder workflow needs, read with a SINGLE file open.
+
+    Keys returned:
+
+      ``file_format`` ``resolution`` ``color_space`` ``file_size_mb``
+          exactly the template's deliverable metadata (same values
+          ``image_metadata`` produces, so the Excel looks identical);
+      ``date_created``   capture date, ISO (YYYY-MM-DD);
+      ``date_modified``  edit date, ISO (EXIF ``DateTime``, else file mtime);
+      ``capture`` / ``modified``  the raw EXIF strings (or None);
+      ``software``       EXIF ``Software`` value ('' when absent);
+      ``area``           pixel count (0 when unreadable);
+      ``nbytes``         file size in bytes;
+      ``modified_epoch`` when the file was last written (for ranking);
+      ``is_raw``         True for a camera RAW extension.
+
+    Never raises: an unreadable file simply comes back with blank fields, so one
+    odd photo in 80,000 cannot stop a run.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    nbytes = 0
+    try:
+        nbytes = os.path.getsize(path)
+    except Exception:
+        pass
+
+    info = {
+        "path": path,
+        "is_raw": ext in RAW_EXTS,
+        "file_format": _normalise_format(ext),
+        "resolution": "",
+        "color_space": "",
+        "file_size_mb": round(nbytes / (1024 * 1024), 1) if nbytes else "",
+        "date_created": "",
+        "date_modified": "",
+        "capture": None,
+        "modified": None,
+        "software": "",
+        "area": 0,
+        "nbytes": nbytes,
+        "modified_epoch": 0.0,
+    }
+
+    # --- RAW: reuse the mmap/Exif scanners (no full decode) ---------------- #
+    if ext in RAW_EXTS:
+        meta = image_metadata(path)
+        for key in ("file_format", "resolution", "color_space",
+                    "file_size_mb", "date_created"):
+            if meta.get(key):
+                info[key] = meta[key]
+        try:
+            w, h = (int(v) for v in str(info["resolution"]).split("x"))
+            info["area"] = w * h
+        except Exception:
+            pass
+        mod = modified_time(path)
+        if mod:
+            info["modified"] = str(mod)
+            info["date_modified"] = _iso_date(mod) or _file_date(path)
+        info["software"] = str(_raw_tag_value(path, _TAG_SOFTWARE) or "").strip()
+        if not info["date_created"]:
+            stamp = capture_time(path)
+            info["date_created"] = _iso_date(stamp) or _file_date(path)
+        info["modified_epoch"] = _dt_epoch(mod) or _mtime_epoch(path)
+        return info
+
+    # --- Raster: one Pillow open gives format, size, ICC, colour + dates --- #
+    cap = mod = None
+    info["file_format"] = _normalise_format(ext)
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            info["resolution"] = f"{w}x{h}"
+            info["area"] = int(w) * int(h)
+            exif = im.getexif()
+            info["color_space"] = (_icc_color_space(im)
+                                   or _exif_color_space(exif)
+                                   or _MODE_COLOR_SPACE.get((im.mode or "").upper(), ""))
+            info["software"] = str(exif.get(_TAG_SOFTWARE) or "").strip()
+            try:
+                ifd = exif.get_ifd(0x8769)
+            except Exception:
+                ifd = {}
+            # DateTimeOriginal (36867) / DateTimeDigitized (36868) belong in the
+            # Exif sub-IFD, but some exporters leave them in IFD0 - so fall back
+            # to the base directory rather than losing the capture date.
+            cap = (ifd.get(36867) or ifd.get(36868)
+                   or exif.get(36867) or exif.get(36868))
+            mod = exif.get(306)                      # DateTime (rewritten by editors)
+    except Exception:
+        pass
+
+    if cap:
+        info["capture"] = str(cap)
+    if mod:
+        info["modified"] = str(mod)
+    info["date_created"] = _iso_date(cap) or _file_date(path)
+    info["date_modified"] = _iso_date(mod) or _file_date(path)
+    info["modified_epoch"] = _dt_epoch(mod) or _mtime_epoch(path)
+    return info

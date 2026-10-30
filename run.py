@@ -81,6 +81,70 @@ def looks_like_shoot(path, originals_name, edits_name):
     return (originals_name in names) or (edits_name in names)
 
 
+# Extensions that count as a photo when deciding the input layout. Kept local so
+# run.py never has to import Pillow just to look at a folder.
+_PHOTO_EXTS = {
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp",
+    ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".raf",
+    ".orf", ".rw2", ".pef", ".dng", ".raw", ".rwl", ".srw", ".3fr", ".fff",
+    ".iiq", ".x3f", ".mrw", ".erf", ".kdc", ".dcr",
+}
+
+
+def _holds_photos(path):
+    """True if `path` directly contains at least one photo file."""
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.is_file() and \
+                        os.path.splitext(e.name)[1].lower() in _PHOTO_EXTS:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def detect_layout(path, originals_name, edits_name):
+    """Work out how the input is organised: ``"shoot"`` or ``"sets"``.
+
+      shoot — the client sent an originals folder (`JPEG`) and/or an edits
+              folder (`Edit`). The original workflow: match every edit to its
+              original by capture timestamp, then categorise.
+      sets  — the client sent one folder per set, each holding the original and
+              its edit side by side, with no Original/Edit folders to say which
+              is which. Typical for 30,000-40,000 pairs; the roles are read from
+              the files themselves.
+
+    Anything ambiguous falls back to ``"shoot"``, so existing inputs keep
+    behaving exactly as they did before.
+    """
+    p = Path(path)
+    if not p.is_dir():
+        return "shoot"
+    if looks_like_shoot(p, originals_name, edits_name):
+        return "shoot"
+    if _holds_photos(p):
+        return "shoot"
+    try:
+        children = [d for d in sorted(p.iterdir()) if d.is_dir()]
+    except OSError:
+        return "shoot"
+    if not children:
+        return "shoot"
+    if looks_like_shoot(children[0], originals_name, edits_name):
+        return "shoot"
+    if _holds_photos(children[0]):
+        return "sets"
+    for child in children[:20]:
+        try:
+            nested = [d for d in sorted(child.iterdir()) if d.is_dir()]
+        except OSError:
+            continue
+        if nested and _holds_photos(nested[0]):
+            return "sets"
+    return "shoot"
+
+
 def detect_shoots(path, originals_name, edits_name):
     """Return a list of shoot folder paths (single shoot, or all sub-shoots)."""
     p = Path(path)
@@ -117,7 +181,22 @@ def main():
     ap.add_argument("--model", default=None,
                     help="model name (default: claude-haiku-4-5 for anthropic, "
                          "gpt-4o-mini for openai)")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="parallel caption requests (default: 6 for a shoot, "
+                         "8 for a set-folder run)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="set-folder layout only: process just the first N sets")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="set-folder layout only: find and pair the sets, write "
+                         "report.csv, and stop before any API call")
     args = ap.parse_args()
+
+    # The client now sends two possible layouts. Detect which one this is, so
+    # the same command works for both and no flag has to be remembered.
+    layout = detect_layout(args.input, args.originals_name, args.edits_name)
+    if layout == "sets":
+        run_sets(args)
+        return
 
     shoots = detect_shoots(args.input, args.originals_name, args.edits_name)
     batch = len(shoots) > 1
@@ -179,6 +258,10 @@ def main():
                    "--provider", args.provider]
         if args.model:
             cat_cmd += ["--model", args.model]
+        if args.workers:
+            cat_cmd += ["--workers", str(args.workers)]
+        if args.limit:
+            cat_cmd += ["--limit", str(args.limit)]
         run(cat_cmd)
 
     print(flush=True)
@@ -199,6 +282,60 @@ def main():
     print(flush=True)
     say("If any rows look wrong, check 'confidence' in report.csv - values of "
         "0.3, or method=unmatched, are the ones worth eyeballing first.")
+
+
+def run_sets(args):
+    """Run the set-folder workflow (one folder per set, 2 photos each).
+
+    Delegates to sets_pipeline.py, which reads each photo's role from its own
+    metadata instead of from Original/Edit folder names, and streams the Excel
+    sheet so 40,000 sets (~80,000 rows) fits in memory.
+    """
+    print(flush=True)
+    rule("=")
+    say("PHOTO PIPELINE - SET-FOLDER LAYOUT")
+    rule("=")
+    say(f"input    : {args.input}")
+    say(f"detected : one folder per set (original + edit side by side)")
+    say(f"provider : {args.provider}")
+    if args.dry_run:
+        say("mode     : DRY RUN - pairs the sets and writes report.csv only")
+    print(flush=True)
+    say("Why this differs from a shoot: there are no 'JPEG' / 'Edit' folders, "
+        "so each photo's role is read from its own metadata (EXIF Software, "
+        "edit date, pixel size, byte size) before anything is captioned.")
+    say("Nothing in your source folders is moved, renamed or deleted.")
+
+    out = args.out or os.path.join(args.input, "_out")
+    cmd = [sys.executable, "sets_pipeline.py",
+           "--sets-root", args.input,
+           "--out", out,
+           "--provider", args.provider]
+    if args.model:
+        cmd += ["--model", args.model]
+    if args.workers:
+        cmd += ["--workers", str(args.workers)]
+    if args.limit:
+        cmd += ["--limit", str(args.limit)]
+    if args.dry_run:
+        cmd += ["--dry-run"]
+    print(flush=True)
+    run(cmd)
+
+    print(flush=True)
+    rule("=")
+    say(f"DONE in {time.time() - _MAIN_T0:.1f}s")
+    rule("=")
+    say("What to open:")
+    say("photos.xlsx  - categories + captions, same 17-column template "
+        "(start here)", indent=2)
+    say(os.path.join(out, "photos.xlsx"), indent=4)
+    say("report.csv   - which photo of each set was treated as the original, "
+        "and why", indent=2)
+    say(os.path.join(out, "report.csv"), indent=4)
+    print(flush=True)
+    say("Rows with a low 'confidence' in report.csv are the ones to eyeball "
+        "first: they were paired without a strong metadata signal.")
 
 
 if __name__ == "__main__":
