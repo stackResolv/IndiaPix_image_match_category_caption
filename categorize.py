@@ -120,8 +120,9 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 # Longest side (px) of the image we send to the model. Small = cheap, still clear.
 SEND_MAX = 640
 
-# Token budget: five fields, two of them descriptions plus a keyword list.
-MAX_TOKENS = 500
+# Token budget: five fields, two compact descriptions, a long title and a
+# 13-18 term keyword list. Sized so the JSON never gets cut off.
+MAX_TOKENS = 700
 
 # Operations used in edit_operation — the client's eight, exactly. Everything the
 # model says (and everything an older cache holds) is mapped onto this list by
@@ -183,19 +184,26 @@ _CATEGORY_RULES = (
 )
 
 _TITLE_RULE = (
-    "TITLE — a real, readable sentence of at most 7 or 8 words (never more). "
-    "Sentence case: capitalise only the first word and proper nouns "
-    "(e.g. \"Woman buying spices at a Jaipur market\"). It must read as a "
-    "sentence, not a keyword list — so no comma-separated fragments and NO "
-    "trailing period.\n\n"
+    "TITLE — a real, readable sentence of 9 to 10 MEANINGFUL words. Count only "
+    "content words: articles (a, an, the) do NOT count towards the 9-10, so "
+    "the title may run to 11-13 words in total but must carry at least 9 and "
+    "at most 10 meaningful words. Sentence case: capitalise only the first "
+    "word and proper nouns (e.g. \"Woman buying fresh spices at a busy Jaipur "
+    "market stall\"). It must read as one grammatical sentence, not a "
+    "keyword list — so no comma-separated fragments, no filler like "
+    "\"image of\" or \"photograph of\", and NO trailing period.\n\n"
 )
 
 _KEYWORDS_RULE = (
-    "KEYWORDS — 8 to 15 lowercase keywords (capitalise place and proper names, "
-    "e.g. \"India\"), comma-separated with NO space after the commas, ordered "
-    "from most to least specific. Include the place, the subject, the activity "
-    "and the mood where relevant (e.g. \"market,spices,woman,India,street\"). "
-    "No duplicates, no hashtags, no trailing comma.\n\n"
+    "KEYWORDS — 13 to 18 lowercase keywords minimum 13 (capitalise place and "
+    "proper names, e.g. \"India\"), comma-separated with NO space after the "
+    "commas, ordered from most to least specific. Go well past the obvious: "
+    "include the place, the subject/who, the activity, clothing and props, "
+    "the setting, the lighting, the colour palette, the mood/emotion, the "
+    "season or festival, the image style and any broad commercial use-case "
+    "terms (e.g. \"spice market,turmeric,vendor,woman,saree,India,Jaipur,"
+    "street,crowd,daylight,warm tones,travel,culture,retail\"). No "
+    "duplicates, no hashtags, no trailing comma.\n\n"
 )
 
 # ---- prompt used when BOTH the original and the final edit are available ---- #
@@ -205,14 +213,18 @@ PROMPT_PAIR = (
     "  IMAGE 1 = the ORIGINAL camera file (untouched).\n"
     "  IMAGE 2 = the FINAL delivered edit of that same shot.\n\n"
     + _CATEGORY_RULES + _TITLE_RULE + _KEYWORDS_RULE +
-    "original_description — one sentence, max 25 words, describing exactly what "
-    "is visible in IMAGE 1, the original (e.g. \"Woman selecting spices at a "
-    "market stall, crowd in background\"). No trailing period.\n\n"
-    "final_description — one sentence, max 25 words, describing IMAGE 2. If it "
-    "is the same scene edited, START WITH \"Same scene with \" and name only "
-    "what changed (e.g. \"Same scene with background crowd removed and warm "
-    "color grade\"). If the framing or subject changed substantially, describe "
-    "the result directly instead. No trailing period.\n\n"
+    "original_description — ONE sentence of about 20 words (18 to 22, never "
+    "more than 25), describing exactly what is visible in IMAGE 1, the "
+    "original: the main subject, what they are doing, and the setting or light "
+    "(e.g. \"Woman selecting spices at a busy Jaipur market stall, warm "
+    "daylight, crowd behind her\"). Be concrete and visual, never speculative. "
+    "No trailing period.\n\n"
+    "final_description — ONE sentence of about 20 words (18 to 22, never more "
+    "than 25), describing IMAGE 2. If it is the same scene edited, START WITH "
+    "\"Same scene with \" and name only what changed (e.g. \"Same scene with "
+    "the crowd removed and a warmer colour grade\"). If the framing or subject "
+    "changed substantially, describe the result directly instead. No trailing "
+    "period.\n\n"
     "edit_operation — one or more operations, semicolon-separated, most "
     "important first, chosen ONLY from this vocabulary: " +
     "; ".join(EDIT_OPS) + ".\n"
@@ -237,8 +249,9 @@ PROMPT_SINGLE = (
     "You are tagging photos for a professional Indian photo-library business. "
     "Read the image and output four fields.\n\n"
     + _CATEGORY_RULES + _TITLE_RULE + _KEYWORDS_RULE +
-    "final_description — one sentence, max 25 words, describing what is "
-    "actually visible: subject, action, setting, lighting and colours. No "
+    "final_description — ONE sentence of about 20 words (18 to 22, never more "
+    "than 25), describing what is actually visible: the subject, the action, "
+    "the setting, the lighting and the colours. Be concrete and visual. No "
     "speculation, no camera or editing talk. No trailing period.\n\n"
     "Return ONLY compact JSON and nothing else:\n"
     '{"category": "...", "title": "...", "keywords": "...", '
@@ -259,9 +272,11 @@ TEMPLATE_COLUMNS = [
 # White BG / Others), appended after the 17 template columns for review.
 EXTRA_COLUMNS = ["category"]
 
-# Longest keyword list we keep (the prompt asks for 8-15), so a chatty
-# model cannot bloat a cell.
-MAX_KEYWORDS = 15
+# Keyword list bounds. The prompt asks for 13-18; MAX stops a chatty model from
+# bloating a cell, MIN is enforced by topping up from the title/description when
+# the model comes back short (see _normalise_keywords).
+MIN_KEYWORDS = 13
+MAX_KEYWORDS = 18
 
 # Fractional aspect-ratio change that counts as a crop rather than a resize.
 CROP_AR_TOLERANCE = 0.02
@@ -410,9 +425,71 @@ def _clean_sentence(value):
     return t
 
 
-# Longest title we write. The prompt asks for 7-8 words; this is the hard cap so
-# a chatty answer cannot overflow the cell.
-MAX_TITLE_WORDS = 8
+# Description length. The prompt asks for one sentence of about 20 words; this
+# is the hard cap so a chatty answer cannot overflow the cell.
+DESCRIPTION_MAX_WORDS = 25
+
+
+def _normalise_description(value):
+    """One compact sentence of about 20 words (hard cap 25).
+
+    The prompt asks for this, but a model can drift, so the cell is made
+    compliant regardless: the first clause is kept and anything past the cap is
+    dropped, cutting at a comma/semicolon boundary when one exists so the text
+    still reads as a whole phrase rather than a clipped one.
+    """
+    text = _clean_sentence(value)
+    if not text:
+        return ""
+
+    # The keyword rule ("no space after the commas") sometimes bleeds into the
+    # prose, giving "saturation,improved contrast". Restore the missing spaces
+    # so a description always reads as a sentence.
+    text = re.sub(r",(?=[^\s\d])", ", ", text)
+
+    # Keep the first sentence only — a second clause is what made descriptions
+    # run long before.
+    m = re.search(r"[.!?](\s|$)", text)
+    if m:
+        text = text[: m.start()].rstrip(" ,;:-")
+
+    words = text.split()
+    if len(words) > DESCRIPTION_MAX_WORDS:
+        head = words[:DESCRIPTION_MAX_WORDS]
+        cut = None
+        for i in range(len(head) - 1, 5, -1):      # keep at least 6 words
+            if head[i].strip().endswith((",", ";", ":")):
+                cut = i + 1
+                break
+        words = head[:cut] if cut else head
+
+        # Never end on a hanging joining word.
+        while len(words) > 3 and \
+                words[-1].strip(",;:-").lower() in _DANGLING_WORDS:
+            words.pop()
+
+    return " ".join(words).rstrip(" ,;:-")
+
+
+# Title length. The prompt asks for 9-10 MEANINGFUL words; articles (a, an, the)
+# are not counted towards that number, so the budget below is enforced on the
+# meaningful count, with a looser total-word cap as a second guard.
+TITLE_MIN_WORDS = 9
+TITLE_MAX_WORDS = 10
+
+# Total words allowed in the cell: TITLE_MAX_WORDS content words plus a few
+# articles. Anything longer is trimmed so a chatty answer cannot overflow.
+MAX_TITLE_WORDS = 14
+
+# Articles: ignored when counting the 9-10 meaningful words.
+_ARTICLES = {"a", "an", "the"}
+
+# Openers the prompt forbids ("image of a woman ..."); stripped before counting
+# so the title starts on the subject. Longest phrase first.
+_FILLER_OPENERS = (
+    "a photograph of ", "a picture of ", "an image of ", "a photo of ",
+    "photograph of ", "picture of ", "image of ", "photo of ",
+)
 
 # Words a truncated title must never end on: articles, conjunctions, prepositions
 # and bare possessives all leave the sentence hanging.
@@ -438,13 +515,23 @@ _PROPER_NOUNS = {
 }
 
 
+def _meaningful_count(words):
+    """How many words count towards the 9-10 title budget (articles excluded)."""
+    return sum(1 for w in words
+               if w.strip(".,;:!?\"'()").lower() not in _ARTICLES)
+
+
 def _normalise_title(value):
-    """A sentence of at most MAX_TITLE_WORDS words, in sentence case.
+    """A 9-10 meaningful-word sentence, in sentence case.
 
     The prompt asks the model for this, but a model can always drift: this makes
-    it true in the cell regardless. Sentence case means "capitalise the first
-    word and proper nouns", so a title that arrives in Title Case is folded down
-    ("Woman At Spice Market, Jaipur" -> "Woman at spice market, Jaipur").
+    it true in the cell regardless. Articles (a, an, the) do not count towards
+    the 9-10 budget, and a longer answer is trimmed from the end without ever
+    leaving a dangling article, conjunction or preposition.
+
+    Sentence case means "capitalise the first word and proper nouns", so a title
+    that arrives in Title Case is folded down ("Woman At Spice Market, Jaipur"
+    -> "Woman at spice market, Jaipur").
     """
     text = _clean_sentence(value)
     if not text:
@@ -453,25 +540,28 @@ def _normalise_title(value):
     # Drop a trailing ellipsis/comma and collapse any doubled spaces.
     text = text.rstrip(" ,;:-")
 
-    # Cap the length. Prefer cutting at a natural phrase boundary (a comma)
-    # within the cap, so the title reads as a whole phrase rather than a
-    # half-finished clause; fall back to a hard trim that never leaves a
-    # dangling comma or conjunction.
+    # Strip a forbidden "image of / photograph of" opener, so the title starts
+    # on the subject and the opener does not waste a word of the budget.
+    low = text.lower()
+    for opener in _FILLER_OPENERS:
+        if low.startswith(opener):
+            text = text[len(opener):].lstrip(" ,;:-")
+            break
+
+    # Trim from the end while over budget — never below the 9-word floor, since
+    # a short-but-whole title reads better than a maimed one.
     words = text.split()
-    if len(words) > MAX_TITLE_WORDS:
-        head = words[:MAX_TITLE_WORDS]
-        cut = None
-        for i in range(len(head) - 1, 3, -1):      # keep at least 4 words
-            if head[i].endswith(","):
-                cut = i
-                break
-        if cut:
-            words = head[:cut]
-        else:
-            words = head
-            while words and words[-1].strip(",;:-").lower() in _DANGLING_WORDS:
-                words.pop()
-        text = " ".join(words).rstrip(" ,;:-")
+    while words and (_meaningful_count(words) > TITLE_MAX_WORDS
+                     or len(words) > MAX_TITLE_WORDS):
+        if _meaningful_count(words) <= TITLE_MIN_WORDS:
+            break
+        words.pop()
+
+    # Never end on a comma or a hanging joining word.
+    while len(words) > 1 and words[-1].strip(",;:-").lower() in _DANGLING_WORDS:
+        words.pop()
+
+    text = " ".join(words).rstrip(" ,;:-")
 
     # Sentence case. A word keeps its capital when it starts the title, is a
     # known proper noun, or carries an inner capital (iPhone, McLeod).
@@ -488,29 +578,63 @@ def _normalise_title(value):
     return " ".join(out)
 
 
-def _normalise_keywords(value):
+# Filler words the keyword top-up must never promote into a keyword.
+_KEYWORD_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "with", "without", "of", "in", "on",
+    "at", "to", "from", "by", "for", "as", "into", "onto", "over", "under",
+    "near", "is", "are", "was", "were", "be", "been", "being", "has", "have",
+    "had", "this", "that", "these", "those", "it", "its", "his", "her", "their",
+    "very", "while", "same", "scene", "image", "photo", "picture", "shot",
+    "there", "here", "which", "who", "what", "when", "where", "how", "also",
+}
+
+
+def _normalise_keywords(value, extra_text=""):
     """Return a clean 'a,b,c' keyword string, no spaces after the commas.
 
     Casing is preserved so proper names stay capitalised ("India"), exactly like
     the template's keyword style; duplicates are removed case-insensitively.
+
+    The client requires a minimum number of keywords, so a short model answer is
+    topped up from `extra_text` (the title and descriptions of the same label):
+    those words describe the very same photo, so promoting them into keywords is
+    honest rather than invented.
     """
     if isinstance(value, (list, tuple)):
         parts = [str(v) for v in value]
     else:
         parts = str(value or "").replace(";", ",").replace("#", "").split(",")
     out, seen = [], set()
-    for p in parts:
-        k = _clean_text(p).strip(" .,;")
-        if not k:
-            continue
+
+    def add(k):
+        k = _clean_text(k).strip(" .,;:'\"")
+        if not k or len(k) < 3:
+            return
         low = k.lower()
-        if low in seen:
-            continue
+        if low in seen or low in _KEYWORD_STOPWORDS:
+            return
         seen.add(low)
         out.append(k)
+
+    for p in parts:
+        add(p)
         if len(out) >= MAX_KEYWORDS:
             break
-    return ",".join(out)
+
+    # Top up to the minimum from the label's own prose (title + descriptions).
+    # The words keep their original casing (so "Jaipur" stays capitalised) and
+    # their order of appearance, and words under four letters are skipped: they
+    # are almost always too generic to earn a keyword slot.
+    if len(out) < MIN_KEYWORDS and extra_text:
+        for raw in str(extra_text).split():
+            cand = raw.strip(".,;:!?\"'()[]")
+            if len(cand) < 4:
+                continue
+            add(cand)
+            if len(out) >= MIN_KEYWORDS:
+                break
+
+    return ",".join(out[:MAX_KEYWORDS])
 
 
 # Every synonym/sloppy term we have seen (or that the previous vocabulary used)
@@ -722,15 +846,21 @@ def _normalise(data, has_original=True):
             break
     else:
         cat = "Others"
-    final_desc = _clean_sentence(data.get("final_description")
-                                 or data.get("description"))
+    final_desc = _normalise_description(data.get("final_description")
+                                        or data.get("description"))
+    orig_desc = (_normalise_description(data.get("original_description"))
+                 if has_original else "")
+    title = _normalise_title(data.get("title"))
     ops = _normalise_ops(data.get("edit_operation")) if has_original else ""
     return {
         "category": cat,
-        "title": _normalise_title(data.get("title")),
-        "keywords": _normalise_keywords(data.get("keywords")),
-        "original_description": (_clean_sentence(data.get("original_description"))
-                                 if has_original else ""),
+        "title": title,
+        # The label's own prose is passed in so a short keyword list can be
+        # topped up to the client's 13-keyword minimum.
+        "keywords": _normalise_keywords(
+            data.get("keywords"),
+            extra_text=" ".join((title, orig_desc, final_desc))),
+        "original_description": orig_desc,
         "final_description": final_desc,
         "edit_operation": ops,
     }
@@ -1015,11 +1145,13 @@ def main():
          "can name the real difference (crop, colour grade, retouching, ...).")
     note("cost    : roughly $0.001-0.002 per edit with this model.")
 
-    # v6 cache: v5 predates the 7-8 word sentence title, so its titles would
-    # arrive in Title Case and far too long. Keeping the name in step with the
-    # prompt shape means a stale cache is ignored, not silently mixed in.
+    # v8 cache: v7 holds multi-sentence 35-70 word descriptions, which are far
+    # longer than the one-sentence ~20 words the template wants; v6 and earlier
+    # also hold 7-8 word titles and short keyword lists. Keeping the name in
+    # step with the prompt shape means a stale cache is ignored rather than
+    # silently mixed in.
     cache_path = os.path.join(os.path.dirname(os.path.abspath(args.out)) or ".",
-                              "labels_cache_v6.json")
+                              "labels_cache_v8.json")
     cache = {}
     if not args.no_cache and os.path.isfile(cache_path):
         try:

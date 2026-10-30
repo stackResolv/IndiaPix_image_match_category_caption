@@ -68,11 +68,12 @@ setup_console()
 _T0 = time.time()
 
 # Label cache, keyed by "<set>/<edit>|<original>". Versioned because the prompt
-# decides which fields exist — a new cache name avoids mixing shapes. v4 adds the
-# 7-8 word sentence TITLE (v3 titles are Title Case and often 10+ words), v3
-# added the `edit_category` column, v2 was the client's eight-operation
-# vocabulary, v1 held the old operation names.
-CACHE_NAME = "labels_cache_sets_v4.json"
+# decides which fields exist — a new cache name avoids mixing shapes. v6 keeps
+# the 9-10 meaningful-word title (articles excluded) and the 13+ keyword list
+# from v5, but descriptions are back to ONE sentence of about 20 words instead
+# of the multi-sentence 35-70 word text v5 held. v3 added the `edit_category`
+# column, v2 was the client's eight-operation vocabulary, v1 held old op names.
+CACHE_NAME = "labels_cache_sets_v6.json"
 
 # Progress is checkpointed this often, so an interrupted 40,000-set run loses
 # minutes of API spend, not hours.
