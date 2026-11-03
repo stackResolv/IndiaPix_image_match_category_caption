@@ -806,6 +806,209 @@ def dominant_op(value):
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# Prose cues — the model's own description of the change is evidence too
+# --------------------------------------------------------------------------- #
+# A vision model sometimes answers every field except edit_operation (or names
+# only the most obvious operation). Its final_description, however, usually
+# says what happened in plain words: "Same scene with the crowd removed and a
+# warmer colour grade". Reading that sentence back gives the client a filled
+# cell instead of a blank one, and adds the operations the model did not list.
+#
+# The cues are split because they carry different weight:
+#
+#   _OP_CUES_STRONG  name a concrete, visible piece of work (an object removed,
+#                    a backdrop swapped, the frame cropped). Worth adding even
+#                    beside a model answer: that is how a cell ends up naming
+#                    every operation the pair actually shows.
+#   _OP_CUES_GENERIC only say "something was tweaked" ("slightly adjusted",
+#                    "warmer"). Used solely to fill a cell that would otherwise
+#                    be blank, so a real answer is never padded with filler.
+#
+# A phrase that says nothing happened suppresses both, so the cell is told the
+# truth ("none") rather than invented.
+_NO_CHANGE_CUES = (
+    "no visible change", "no visible changes", "no change", "no changes",
+    "unchanged", "identical", "nothing changed", "no discernible",
+    "no noticeable change", "pixel dimensions only",
+)
+
+_OP_CUES_STRONG = (
+    # something disappeared, was taken out, or was put somewhere else
+    ("object_removal", (
+        "removed", "remove", "removal", "erased", "erasing", "deleted",
+        "disappeared", "gone", "no longer there", "taken out", "cloned out",
+        "cleaned up", "cleaning up", "spot healed", "dust spot",
+        "dust spots", "dust removal", "dust removed", "dusted off",
+    )),
+    # something was ADDED, moved or rearranged: the composition changed
+    ("compositing", (
+        "added", "adding", "additional", "extra", "inserted", "pasted",
+        "combined", "composite", "merged", "overlaid", "overlay", "watermark",
+        "double exposure", "new element", "introduced", "sky replacement",
+        "sky swapped", "element added", "logo added", "text added",
+        "graphic added", "number changed", "design changed", "label changed",
+        "text changed", "sign changed", "pattern changed", "logo changed",
+        "screen turned off", "screen turned on", "screen replaced",
+        "turned off", "turned on", "more visibly", "more prominently",
+        "no longer visible",
+        # Rearranging is not a removal - the same items are all still there,
+        # only their placement changed, which is a composition change.
+        "repositioned", "re arranged", "rearranged", "moved", "shifted",
+        "different arrangement", "arranged differently", "swapped places",
+    )),
+    # the backdrop itself changed
+    ("background", (
+        "background replaced", "background removed", "background cleaned",
+        "background changed", "background blurred", "background extended",
+        "background swapped", "backdrop", "white background", "plain white",
+        "cut out", "cutout", "studio background", "isolated on white",
+    )),
+    # skin / face / body work
+    ("skin_portrait", (
+        "skin", "blemish", "retouch", "teeth", "whitened", "eyes brightened",
+        "eye brightened", "complexion", "smoothing of the face", "hair cleanup",
+        "makeup", "figure slimmed", "body reshaped", "liquify",
+    )),
+    # the frame changed
+    ("crop_perspective", (
+        "cropped", "crop", "re framed", "reframed", "framing", "straightened",
+        "rotated", "perspective", "aspect ratio", "tighter frame",
+        "wider frame", "lens correction", "horizon", "keystone",
+    )),
+    # colour cast only
+    ("white_balance", (
+        "white balance", "colour cast", "color cast", "yellow cast",
+        "blue cast", "warmer cast", "cooler cast", "colour temperature",
+        "color temperature", "neutralised", "neutralized", "tint corrected",
+    )),
+    # detail only
+    ("sharpen_denoise", (
+        "sharpened", "sharper", "sharpen", "denoised", "noise reduced",
+        "grain reduced", "clarity", "more detail", "micro contrast",
+        "texture enhanced",
+    )),
+)
+
+# Read ONLY to fill a cell that would otherwise be blank: the model described a
+# change without naming a concrete one ("cup placed on a coaster", "gift pack
+# visible"), and the plainest reading is that an element arrived or moved.
+_OP_CUES_WEAK = (
+    ("compositing", (
+        "placed", "positioned", "stacked", "visible", "appeared", "wrapped in",
+        "on the table", "in the background", "more centrally",
+    )),
+)
+
+_OP_CUES_GENERIC = (
+    ("color_tonal", (
+        "colour grade", "color grade", "colour graded", "color graded",
+        "grading", "warmer", "cooler", "brighter", "darker", "lighter",
+        "more vivid", "saturation", "contrast", "vibrance", "tonal", "tone",
+        "mood", "vignette", "black and white", "monochrome", "sepia",
+        "exposure", "colour", "color", "light", "adjusted", "adjustment",
+        "adjustments", "tweaked", "tweak", "polished", "enhanced",
+        # Vague, but they do say the frame was worked on: "slightly altered",
+        # "minor edits", "the design changed". Only ever used to fill an empty
+        # cell, never beside a real answer.
+        "altered", "changed", "minor edit", "minor edits", "edited",
+    )),
+)
+
+
+def ops_from_text(text, generic=False):
+    """The operations a piece of prose names, most specific first.
+
+    Used on the label's own final_description/title, so a model that forgot to
+    fill edit_operation still gets an honest cell: its sentence said "the crowd
+    removed and a warmer colour grade", which IS the answer. `generic=False`
+    reads only the strong cues (concrete work); `generic=True` also reads the
+    "something was tweaked" cues, which are only worth using to fill a cell.
+    """
+    low = _clean_text(text).lower()
+    if not low:
+        return []
+    low = low.replace("_", " ").replace("-", " ")
+    while "  " in low:
+        low = low.replace("  ", " ")
+    if any(cue in low for cue in _NO_CHANGE_CUES):
+        return []
+    out = []
+    tables = ((_OP_CUES_STRONG, _OP_CUES_WEAK, _OP_CUES_GENERIC) if generic
+              else (_OP_CUES_STRONG,))
+    for table in tables:
+        for op, cues in table:
+            if op in out:
+                continue
+            if any(re.search(rf"\b{re.escape(cue)}", low) for cue in cues):
+                out.append(op)
+    return out
+
+
+def complete_ops(model_ops, hint_text="", measured=None, fallback=""):
+    """The edit_operation cell: model answer, then measured, then prose.
+
+    Evidence order — what the vision model actually reported, then what the file
+    metadata proves (a changed aspect ratio IS a crop), and **only if those are
+    empty**, what the label's own description names.
+
+    The prose is deliberately a LAST RESORT that only fills a blank cell. It
+    must never extend a real answer: a description like "scissors added on the
+    desk" is a model error that already said `object_removal`, and adding
+    `compositing` on top would record an operation no model reported and no
+    human confirmed. Blank is a defect; invented is worse.
+
+    `fallback` is written when nothing at all was found. A pair whose two files
+    really are alike has no operation to name, and the caller passes "none" so
+    the client sees that stated instead of an empty cell that looks like a lost
+    row.
+    """
+    parts = ops_ordered(model_ops)
+    for op in measured or []:
+        if op not in parts:
+            parts.append(op)
+    if not parts:
+        # Blank cell -> read the label's own sentence. Never used to extend.
+        parts = ops_from_text(hint_text, generic=True)
+    return ";".join(parts) if parts else fallback
+
+
+def explain_ops(folder_op="", model_ops="", measured=None, hint_text="",
+                fallback=""):
+    """The same decision as `merge_ops`/`complete_ops`, with its evidence laid out.
+
+    Returns ``(cell, sources)`` where `sources` names exactly where each term
+    came from. Every row is logged this way, so a reviewer can see why a cell
+    reads what it reads instead of having to re-run the model.
+    """
+    sources = {}
+    parts = []
+
+    def push(op, why):
+        if op and op not in parts:
+            parts.append(op)
+            sources[op] = why
+
+    if folder_op:
+        push(folder_op, "folder")
+        already = set(ops_ordered(folder_op))
+    else:
+        already = set()
+
+    for op in ops_ordered(model_ops):
+        if op not in already:
+            push(op, "model")
+    for op in measured or []:
+        if op not in already:
+            push(op, "measured")
+    if not parts:
+        for op in ops_from_text(hint_text, generic=True):
+            push(op, "prose")
+    if not parts:
+        push(fallback or "none", "fallback")
+    return ";".join(parts), sources
+
+
 def _error_label(msg=""):
     """Uniform label dict for a failed classification."""
     return {"category": "ERROR", "title": "", "keywords": "",
@@ -1312,8 +1515,17 @@ def main():
             label = results[fname]
             edit_meta = meta_of(os.path.join(args.edit_dir, fname),
                                 prefer_modified=True)
-            ops = add_geometry_ops(label.get("edit_operation", ""),
-                                   orig_meta, edit_meta)
+            # The cell reads: what the model reported, then a crop the file
+            # metadata proves, then anything the label's own description names
+            # ("Same scene with the crowd removed ..." is the answer, even when
+            # the model left edit_operation empty). A pair that truly shows no
+            # change says "none" rather than leaving the cell blank.
+            ops = complete_ops(
+                label.get("edit_operation", ""),
+                hint_text=" ".join((label.get("final_description", ""),
+                                    label.get("title", ""))),
+                measured=geometry_ops(orig_meta, edit_meta),
+                fallback="none")
             excel_rows.append(make_row(
                 fname, set_id, f"{n:02d}", "final",
                 label.get("title", "") or title,

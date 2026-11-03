@@ -141,7 +141,32 @@ def relpath(path, root):
         return path
 
 
-def operation_folder(set_name):
+def _operation_segments(set_name, root_name=""):
+    """The folder names around this set, nearest-first, that could be the label.
+
+    ``set_name`` is the set's path relative to the run root, so ``parts[:-1]``
+    are its ancestors *inside* that root. The root itself is an ancestor too —
+    and it is the one that carries the label when the user points the tool
+    straight at the operation folder::
+
+        --sets-root metadata           + sharpen_denoise/SET_1  -> parents
+                                          ['sharpen_denoise']   (+root 'metadata')
+        --sets-root metadata/sharpen_denoise + SET_1          -> parents []
+                                          (+root 'sharpen_denoise')  <-- the label
+
+    Without the root the second case loses the client's label entirely and the
+    model's guess ends up leading the cell. The root name is therefore always
+    considered last, i.e. it only wins when no folder inside the root qualifies.
+    """
+    parts = [p for p in str(set_name or "").replace("\\", "/").split("/") if p]
+    segments = list(reversed(parts[:-1]))
+    root_seg = os.path.basename(os.path.normpath(str(root_name or "").strip()))
+    if root_seg and root_seg not in (".", "..") and root_seg not in segments:
+        segments.append(root_seg)
+    return segments
+
+
+def operation_folder(set_name, root_name=""):
     """The edit-operation folder that contains this set, as an ordered list.
 
     Some deliveries are grouped by *what was done*, not by date:
@@ -157,63 +182,52 @@ def operation_folder(set_name):
     operation first: ``color_tonal;white_balance`` means "graded, and also
     white-balanced".
 
-    Ancestors are checked nearest-first, and only a segment that yields at least
-    one of the client's eight operations is used. A layout grouped by date
-    (`input/2025-03-14/IMG_0001`) therefore yields ``[]`` and nothing changes.
+    Ancestors are checked nearest-first (including the run root itself, so
+    `--sets-root metadata/sharpen_denoise` still finds `sharpen_denoise`), and
+    only a segment that yields at least one of the client's eight operations is
+    used. A layout grouped by date (`input/2025-03-14/IMG_0001`) therefore
+    yields ``[]`` and nothing changes.
     """
-    parts = [p for p in str(set_name or "").replace("\\", "/").split("/") if p]
-    for seg in reversed(parts[:-1]):
+    for seg in _operation_segments(set_name, root_name):
         ops = cat.ops_ordered(seg)
         if ops:
             return ops
     return []
 
 
-def operation_folder_label(set_name):
+def operation_folder_label(set_name, root_name=""):
     """The raw folder name that supplied the operations, or ``''``.
 
     Kept for report.csv so a reviewer sees exactly what the client typed, even
     when it names several operations (``color_tonal;white_balance``).
     """
-    parts = [p for p in str(set_name or "").replace("\\", "/").split("/") if p]
-    for seg in reversed(parts[:-1]):
+    for seg in _operation_segments(set_name, root_name):
         if cat.ops_ordered(seg):
             return seg
     return ""
 
 
-def merge_ops(folder_op, model_ops_value, extra_ops=None):
-    """Folder operations first, then the model's, then measured ones.
+def merge_ops(folder_op, model_ops_value, extra_ops=None, hint_text="",
+              fallback=""):
+    """Folder operations first, then the model's, then measured ones, then prose.
 
     Each source keeps its own order — the folder states the batch's primary
     operation, and the model answers most-important-first — so the final cell
     reads: what the client filed it as, then what else the model could see (by
     its own confidence), then anything the file metadata proves. Duplicates are
     dropped, keeping the earliest (highest-priority) position.
+
+    The label's own prose (`hint_text`) is used **only when the cell would
+    otherwise be empty** — never to extend a real answer. A description saying
+    "scissors added" beside a model answer of `object_removal` is a model error;
+    appending `compositing` would record an operation no model reported and no
+    human confirmed. See `categorize.complete_ops`.
+
+    `fallback` is written only when nothing at all was found.
     """
-    out = []
-
-    def push(op):
-        if op and op not in out:
-            out.append(op)
-
-    # The folder name goes in verbatim as ONE item. It may itself contain ';'
-    # or ',' - the client wrote it that way, so it is never split or
-    # canonicalised; the cell simply starts with the folder's own text.
-    already = set()
-    if folder_op:
-        out.append(folder_op)
-        # Anything the folder name already says must not be repeated behind it,
-        # so "color_tonal;white_balance" + model "white_balance" stays clean.
-        already = set(cat.ops_ordered(folder_op))
-
-    for op in cat.ops_ordered(model_ops_value):
-        if op not in already:
-            push(op)
-    for op in extra_ops or []:
-        if op not in already:
-            push(op)
-    return ";".join(out)
+    cell, _ = cat.explain_ops(folder_op, model_ops_value, extra_ops,
+                              hint_text=hint_text, fallback=fallback)
+    return cell
 
 
 # --------------------------------------------------------------------------- #
@@ -481,7 +495,11 @@ def pair_sets(sets, inspected, root):
             # "color_tonal;white_balance"). The client's name is authoritative
             # and must reach the sheet unchanged, so it is never canonicalised
             # or split here. "" when the layout is not grouped by operation.
-            "op": operation_folder_label(set_name),
+            # The root's own name is checked too, so pointing --sets-root
+            # straight at an operation folder (metadata/sharpen_denoise) still
+            # keeps that name leading the cell.
+            "op": operation_folder_label(set_name, root),
+            "op_from": _operation_segments(set_name, root),
             # The set folder's own name, used verbatim as set_id.
             "set_id": os.path.basename(os.path.normpath(set_dir)),
         })
@@ -810,6 +828,13 @@ def stage_write(records, tasks, results, out_dir):
     Rows are grouped by category so similar photos sit together, and a set's
     rows stay adjacent — exactly like the shoot workflow. Only the *order* is
     computed as a list of indices, so memory stays flat at 80,000 rows.
+
+    Every final row's `edit_operation` is logged with its evidence
+    (`op_sources`: which term came from the folder, the model, the metadata or
+    the prose), and the run ends with a hard invariant: when a set sits in an
+    operation folder, that folder's name must be the FIRST term of the cell.
+    A violation is counted, printed and written to the debug log rather than
+    passing silently.
     """
     step(5, "writing the Excel workbook and the debug log")
     note("rows    : one `00 original` row, then `01`, `02`, ... per edit")
@@ -817,6 +842,14 @@ def stage_write(records, tasks, results, out_dir):
     note("columns : 17 template + `category` (subject type) = 18")
     note("memory  : the sheet is streamed, so 80,000 rows costs the same memory "
          "as 200")
+    note("evidence: every final cell records where each operation came from "
+         "(folder / model / measured / prose / fallback)")
+    note("invariant: the operation folder's name ALWAYS leads the cell when the "
+         "set sits in one - violations are reported, never silent")
+    violations = []
+    op_sources_seen = {}
+    n_filled_by_prose = 0
+    n_empty_from_model = 0
 
     # The first task of a set supplies the shared title / keywords / category.
     first_task = {}
@@ -844,7 +877,9 @@ def stage_write(records, tasks, results, out_dir):
     dw = csv.writer(dbg)
     dw.writerow(["set_folder", "file_id", "role", "matched_original", "category",
                  "method", "confidence", "note", "edit_operation", "title",
-                 "original_description", "final_description", "keywords"])
+                 "original_description", "final_description", "keywords",
+                 "folder_operation", "op_sources", "model_edit_operation",
+                 "description_used_for_prose"])
     try:
         for out_i, ri in enumerate(index, 1):
             r = records[ri]
@@ -868,7 +903,20 @@ def stage_write(records, tasks, results, out_dir):
             if not r["edit_is"]:
                 # A lone photo: one final row, no original row.
                 counts[category] = counts.get(category, 0) + 1
-                ops = merge_ops(folder_op, head.get("edit_operation", ""))
+                lone_model_ops = head.get("edit_operation", "")
+                lone_prose = " ".join((head.get("final_description", ""), title))
+                ops, sources = cat.explain_ops(
+                    folder_op, lone_model_ops,
+                    hint_text=lone_prose, fallback="none")
+                for op, why in sources.items():
+                    op_sources_seen[why] = op_sources_seen.get(why, 0) + 1
+                if not (lone_model_ops or "").strip():
+                    n_empty_from_model += 1
+                if "prose" in sources.values():
+                    n_filled_by_prose += 1
+                if folder_op and not ops.startswith(folder_op):
+                    violations.append((set_id, os.path.basename(orig_path),
+                                       folder_op, ops))
                 row = row_dict(os.path.basename(orig_path), set_id, "01", "final",
                                title, head.get("final_description", ""), keywords,
                                orig_info, category,
@@ -878,7 +926,12 @@ def stage_write(records, tasks, results, out_dir):
                 dw.writerow([r["set"], os.path.basename(orig_path), "final", "",
                              category, r["method"], r["confidence"], r["why"],
                              ops, title, head.get("original_description", ""),
-                             head.get("final_description", ""), keywords])
+                             head.get("final_description", ""), keywords,
+                             folder_op,
+                             " ".join(f"{op}<-{why}"
+                                      for op, why in sources.items()),
+                             lone_model_ops,
+                             lone_prose if "prose" in sources.values() else ""])
                 continue
 
             # Row 00 — the camera original, describing the untouched scene.
@@ -904,8 +957,31 @@ def stage_write(records, tasks, results, out_dir):
                 # in ITS order (the prompt asks most-important-first, i.e. by
                 # confidence), then a crop the file metadata proves outright.
                 measured = cat.geometry_ops(orig_info, edit_info)
-                ops = merge_ops(folder_op, label.get("edit_operation", ""),
-                                measured)
+                # then the label's own prose: a model that left edit_operation
+                # empty still wrote "Same scene with the crowd removed and a
+                # warmer colour grade", and those words ARE the answer. A pair
+                # that truly shows no change says "none" instead of blank.
+                model_ops = label.get("edit_operation", "")
+                prose = " ".join((label.get("final_description", ""),
+                                  label.get("title", ""), title))
+                # Every term is traced to its source so the debug log can
+                # explain the cell instead of just printing it.
+                ops, sources = cat.explain_ops(folder_op, model_ops, measured,
+                                               hint_text=prose,
+                                               fallback="none")
+                for op, why in sources.items():
+                    op_sources_seen[why] = op_sources_seen.get(why, 0) + 1
+                if not (model_ops or "").strip():
+                    n_empty_from_model += 1
+                if "prose" in sources.values():
+                    n_filled_by_prose += 1
+                # INVARIANT: a set inside an operation folder must lead with
+                # that folder's own text. Anything else means the client's
+                # label was lost, and is reported, never ignored.
+                if folder_op and not ops.startswith(folder_op):
+                    violations.append((set_id,
+                                       os.path.basename(r["files"][ei]),
+                                       folder_op, ops))
                 edit_cat = label.get("category", category)
                 counts[edit_cat] = counts.get(edit_cat, 0) + 1
                 row = row_dict(os.path.basename(r["files"][ei]), set_id,
@@ -923,7 +999,12 @@ def stage_write(records, tasks, results, out_dir):
                              label.get("title", ""),
                              label.get("original_description", ""),
                              label.get("final_description", ""),
-                             label.get("keywords", "")])
+                             label.get("keywords", ""),
+                             folder_op,
+                             " ".join(f"{op}<-{why}"
+                                      for op, why in sources.items()),
+                             model_ops,
+                             prose if "prose" in sources.values() else ""])
     finally:
         dbg.close()
 
@@ -931,6 +1012,31 @@ def stage_write(records, tasks, results, out_dir):
     log(f"  excel -> {xlsx_path}  ({sheet.rows_written:,} row(s), "
         f"{len(ALL_COLUMNS)} columns)")
     log(f"  debug -> {debug_path}")
+
+    # ---- how each final cell was built --------------------------------- #
+    total_finals = sum(len(r["edit_is"]) for r in records)
+    log("  edit_operation evidence (per final row):")
+    for why in ("folder", "model", "measured", "prose", "fallback"):
+        n = op_sources_seen.get(why, 0)
+        if n:
+            log(f"{n:>7,} term(s) came from {why}", indent=4)
+    log(f"{total_finals:,} final row(s); the model's own answer was empty on "
+        f"{n_empty_from_model:,}", indent=4)
+    log(f"{n_filled_by_prose:,} cell(s) filled from the label's own "
+        f"description (model left edit_operation blank)", indent=4)
+
+    # ---- the hard invariant -------------------------------------------- #
+    if violations:
+        log(f"[FAIL] {len(violations):,} final row(s) do NOT lead with their "
+            f"operation folder name - the client's label was lost:")
+        for sid, fname, folder, cell in violations[:10]:
+            log(f"{sid}/{fname}: folder {folder!r} -> cell {cell!r}", indent=4)
+        if len(violations) > 10:
+            log(f"... and {len(violations) - 10} more "
+                f"(see categorize_debug.log)", indent=4)
+    else:
+        log("[ok] every set that sits in an operation folder leads its cell "
+            "with that folder's name, verbatim")
     return counts, xlsx_path, debug_path
 
 

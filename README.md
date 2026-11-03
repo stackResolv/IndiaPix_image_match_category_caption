@@ -1,8 +1,15 @@
 # sort_photos
 
-Group edited photos together with the camera originals they were made from,
-so all versions of the same shot sit in one place. Built for photo-library /
+Group edited photos together with the camera originals they were made from, then
+write the IndiaPix metadata sheet for every pair. Built for photo-library /
 photoshoot workflows (large RAW/JPEG libraries, Photoshop-edited derivatives).
+
+Two input layouts are supported, and `run.py` **detects which one you have**:
+
+| Your input | What the tool does |
+|---|---|
+| A **shoot** folder with `JPEG` + `Edit` sub-folders | matches each edit to its original by capture timestamp |
+| One **folder per set** (`IMG_0001/` holding a pair), 30,000-40,000 of them | reads each photo's role from its own metadata — see *Batch — one folder per set* |
 
 - **Runs 100% locally** — no cloud services, no per-image fees. Cost is effectively zero.
 - **Non-destructive** — originals are never moved, renamed, or modified. Files are only *copied* into a new output folder.
@@ -315,6 +322,214 @@ python3 sort_photos.py --root "input_folder" --out "sorted_output"
 
 Each shoot gets its own flat `match/` folder and its own `_out/` (report + Excel).
 With `run.py`, omitting the output argument writes results to `<shoot>/_out`.
+
+### Batch — one folder per set (30,000–40,000 pairs)
+
+Some clients send the collection already grouped, with **no `JPEG` / `Edit`
+sub-folders** — just one folder per set, holding the camera original and its
+edit side by side:
+
+```
+input_folder/
+  IMG_0001/
+    _77A0001.CR3      ← camera original
+    _77A0001.JPG      ← its edit
+  IMG_0002/
+    _77A0002.JPG
+    _77A0002_final.JPG
+  ...
+  IMG_40000/
+```
+
+`run.py` **detects this layout automatically** — no extra flag — and hands off
+to `sets_pipeline.py`:
+
+```bash
+# one command, works for either layout
+python3 run.py "input_folder"
+
+# or drive the set-folder pipeline directly
+python3 sets_pipeline.py --sets-root "input_folder" --out "sorted_output"
+```
+
+Because there are no folder names to say which photo is which, **each photo's
+role is decided from its own metadata**:
+
+| Signal | Weight | Why it is trusted |
+|---|---|---|
+| EXIF `Software` names an editor | `+4` | Photoshop/Lightroom wrote it — near-conclusive |
+| This file is a RAW, the other is not | `-4` | a camera produces the RAW, an export produces the JPEG |
+| Edit date later than capture date | `+2` | `DateTimeOriginal` is preserved, `DateTime` is rewritten |
+| Filename hint (`_final`, `_edit`, `_retouch`) | `+2` | corroboration only, never decisive alone |
+| Smaller pixel area / byte size, later mtime | `+1` | weak — an aggressive crop can go either way |
+
+The result is written to **`report.csv` before any caption is paid for**, so the
+decisions can be reviewed with zero API cost:
+
+```bash
+# 1) pair the sets and stop — no API calls, no cost
+python3 sets_pipeline.py --sets-root "input_folder" --out "sorted_output" --dry-run
+
+# 2) a cheap pilot on the first 200 sets
+python3 sets_pipeline.py --sets-root "input_folder" --out "sorted_output" --limit 200
+
+# 3) the full run (resumable — a re-run never pays twice for the same set)
+python3 sets_pipeline.py --sets-root "input_folder" --out "sorted_output"
+```
+
+#### Sets grouped by operation (`metadata/<operation>/<SET_…>`)
+
+Some deliveries group the sets by **what was done** rather than by date — the
+folder name is the operation, and the sets sit inside it:
+
+```
+metadata/
+  color_tonal/
+    SET_000001/
+      SET_000001_00_original.jpg
+      SET_000001_01_final.jpg
+    SET_000002/
+  sharpen_denoise/
+    SET_000001/
+    SET_000002/
+  color_tonal;white_balance/          ← the folder may name several
+    SET_000001/
+```
+
+Point the pipeline at the parent folder:
+
+```bash
+python3 sets_pipeline.py --sets-root "metadata" --out "metadata_out" --dry-run
+python3 sets_pipeline.py --sets-root "metadata" --out "metadata_out"
+```
+
+#### `edit_operation` — the folder name, verbatim, then the model's operations
+
+The operation folder's name is the client's own label, so it is written **first
+and exactly as typed** — it is never canonicalised, split or re-cased. A name may
+contain `;` or `,` and still be one folder name:
+
+| Folder name | `edit_operation` written |
+|---|---|
+| `color_tonal/` | `color_tonal;color_tonal_model_ops…` |
+| `white balance, crop perspective/` | `white balance, crop perspective;color_tonal` |
+| `color_tonal;white_balance/` | `color_tonal;white_balance;crop_perspective` |
+
+The model's own operations follow, in the order it reported them (most
+important first). An operation the folder name already mentions is not repeated
+behind it. A crop the file metadata proves is appended last. If the input is not
+grouped by operation (a date folder, a bare `IMG_0001/`), the cell is just the
+model's list.
+
+**The folder name always leads — and it is never lost.** The one rule a client
+checks first is that a set filed under `sharpen_denoise/` must have
+`sharpen_denoise` as the **first** term of its cell. That holds even when the
+tool is pointed straight *at* the operation folder:
+
+```bash
+python3 sets_pipeline.py --sets-root "metadata/sharpen_denoise" --out "out"
+# -> every cell starts with "sharpen_denoise;…"
+```
+
+Every run ends by asserting it, printing either
+
+```
+[ok] every set that sits in an operation folder leads its cell with that
+     folder's name, verbatim
+```
+
+or a `[FAIL]` list naming each offending `set_id`, the folder it should have
+led with, and the cell it actually wrote. A violation is never silent.
+
+**No final row is left blank — but no operation is ever invented either.** The
+order of evidence is:
+
+1. the client's operation folder name (**verbatim, first, always**),
+2. the model's own `edit_operation` answer,
+3. anything the file metadata proves (a genuinely changed aspect ratio),
+4. **only if 1–3 produced nothing**, the label's own `description` / `title`
+   (`Same scene with the crowd removed and a warmer colour grade` →
+   `object_removal;color_tonal`),
+5. only if *that* is empty too, `none`.
+
+Step 4 fills a blank cell; it never extends a real answer. If the model said
+`object_removal` and the description happens to say "scissors added", the cell
+stays `object_removal` — writing `compositing` on top would record an operation
+that neither the model reported nor a human confirmed. Blank is a defect;
+invented is worse.
+
+**Every cell is traceable.** `categorize_debug.log` carries four extra columns
+per final row, so a reviewer can see the decision instead of re-running the
+model:
+
+| Column | Shows |
+|---|---|
+| `folder_operation` | the client's operation folder for that set (`''` when not grouped) |
+| `op_sources` | where each term came from — `sharpen_denoise<-folder object_removal<-model` |
+| `model_edit_operation` | the model's raw answer, before any merging |
+| `description_used_for_prose` | the sentence that filled the cell (only when it was blank) |
+
+The run log summarises the same thing: how many terms came from the folder, the
+model, the metadata, the prose or the fallback, how many final rows had an empty
+model answer, and how many were therefore filled from the description.
+
+#### `set_id` — the set folder's own name
+
+`set_id` is taken **directly from the set folder name** and is never renumbered
+or reformatted:
+
+```
+metadata/white_balance/SET_037501/   ->  set_id = SET_037501
+metadata/color_tonal/SET_000002/     ->  set_id = SET_000002
+```
+
+The client's naming convention is preserved exactly, so a sheet can always be
+traced back to the folder it came from.
+
+#### The Excel is identical to the shoot workflow
+
+Same 17 template columns in the same order, same trailing `category` column, same `SET_000001` ids, same colour coding — one
+`00 original` row followed by one `final` row per edit. Only the way the pairs
+are found differs.
+
+#### Scale: 40,000 sets (~80,000 rows)
+
+Measured on a generated 40,000-set / 80,000-photo library:
+
+| Stage | Time | Notes |
+|---|---|---|
+| Discover 40,000 folders | 0.7 s | one `scandir` per folder, no file opens |
+| Read 80,000 photos' metadata | 6 s | EXIF/headers only — **no image is decoded** |
+| Pair + write `report.csv` | 0.5 s | 80,000 rows |
+| Write `photos.xlsx` (80,000 rows) | 10.5 s | streamed, **peak memory 305 MB** |
+
+The sheet is written with openpyxl's **write-only mode** (`excelutil.py`), which
+streams rows straight into the worksheet XML. A normal workbook would hold every
+cell in memory — roughly a gigabyte at 80,000 rows — and the run would die just
+before saving. With streaming, memory is flat: 200 sets and 40,000 sets cost the
+same.
+
+Interrupting a run is safe: labels are checkpointed every 100 sets (written to a
+temp file, then atomically renamed, so a crash cannot corrupt the cache), and a
+re-run continues instead of paying twice.
+
+Set-folder options:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--sets-root` | *(required)* | Folder whose sub-folders are the sets |
+| `--out` | `sorted_output` | Output folder (`photos.xlsx`, `report.csv`) |
+| `--provider` | `auto` | `auto`, `anthropic`, or `openai` |
+| `--model` | provider default | e.g. `claude-haiku-4-5-20251001` / `gpt-4o-mini` |
+| `--workers` | `8` | Parallel API requests |
+| `--limit` | `0` | Only the first N sets (a cheap pilot) |
+| `--dry-run` | off | Pair + write `report.csv` only — stops before any API call |
+| `--no-cache` | off | Ignore cached labels and re-classify |
+
+> Sets with **one photo** get a single `final` row (classified on its own);
+> sets with **three or more** get one `original` row plus one `final` row per
+> extra photo. Both are reported in the run log, never silently dropped.
+> Nested layouts (`input_folder/2025-03-14/IMG_0001/`) are discovered too.
 
 ### Custom sub-folder names
 
@@ -635,14 +850,18 @@ python run.py "input_folder" --provider openai --model gpt-4o
 **Cost / scale:** each pair is downscaled (longest side 640 px per image) and sent
 once — two images per call, but still one request per edit. Roughly
 ~$0.001–0.002 per edit with Haiku → pennies for a normal shoot (159 edits ≈ a few
-cents). Results are cached in `labels_cache_v3.json`, so re-runs are free; use
-`--no-cache` after changing the prompt.
+cents). Results are cached in `labels_cache_v8.json` (set-folder runs use
+`labels_cache_sets_v6.json`), so re-runs are free; use `--no-cache` after
+changing the prompt.
 
-> The cache filename tracks the prompt shape: `labels_cache_v3.json` holds the
-> pair-comparison fields. Older caches (`labels_cache.json`,
-> `labels_cache_v2.json`) cannot supply `edit_operation` /
-> `original_description`, so they are not reused — expect one full pass after
-> upgrading.
+> The cache filename tracks the prompt shape. `v8` (and `_sets_v6`) hold the
+> client's eight-operation vocabulary **and** the current copy spec — a
+> 9–10 meaningful-word title, one ~20-word description and a 13+ keyword list.
+> Caches from earlier builds (`v7`/`_sets_v5` hold multi-sentence 35–70 word
+> descriptions; `v6` and older also hold 7–8 word titles and 8–15 keywords) are
+> **ignored** rather than silently mixed in. Expect one full pass after
+> upgrading — the alternative is a sheet with a mixture of old and new formats,
+> which would break filtering.
 
 ### One original row + one row per edit
 
@@ -658,28 +877,65 @@ mirroring `IndiaPix_metadata_template.csv`:
 If an original has two edits, you get three rows — the original is written
 **once**, not once per edit, so no `edit_state` repeats inside a set.
 
-`edit_operation` uses the template's vocabulary, semicolon-separated, most
-important first: `crop`, `resize`, `straightening`, `color_tonal`, `retouch`,
-`object_removal`, `object_addition`, `background_replacement`, `sharpening`,
-`vignette`, `text_overlay`. The model reports what it can see; a `crop` is also
-added automatically when the two files' aspect ratios genuinely differ
-(orientation alone never counts). `title` and `keywords` are shared by the set;
-`description` differs — the original row describes the untouched scene, the final
-row usually starts with `"Same scene with …"` and names only the change.
+### The eight operations in the sheet
+
+They appear in one column, `edit_operation`, on the `final` rows only:
+
+| Column | Holds | Use it for |
+|---|---|---|
+| `edit_operation` | **all** operations applied, semicolon-separated (`color_tonal;skin_portrait`) | knowing the full edit history of an image |
+
+The `00 original` rows leave it blank — an unedited camera file has no edit type.
+Because the value is a semicolon-separated list, split that column on `;` to
+count each operation (Excel: Data → Text to Columns; or `=LEN(...)-LEN(SUBSTITUTE(...))+1`).
+
+`edit_operation` uses **the client's eight operations**, semicolon-separated:
+
+| Operation code | Meaning | Looks for |
+|---|---|---|
+| `background` | Background removal or replacement | the backdrop replaced, removed to white, blurred or swapped; subject keeps its shape |
+| `color_tonal` | Colour grading and tonal or exposure correction | brightness, exposure, contrast, saturation, vibrance, curves, LUT, vignette — same framing, different light/colour mood |
+| `crop_perspective` | Crop, reframing, and perspective or lens correction | tighter/looser crop, different aspect ratio, straightened horizon, rotation, corrected keystone |
+| `white_balance` | White balance correction | colour-temperature/tint correction only — a cast removed or added, greys reading neutral |
+| `sharpen_denoise` | Sharpening and noise reduction | detail only — sharpening/clarity/texture, or noise/grain reduction |
+| `compositing` | Compositing or element addition | elements combined — something **added**, sky swapped, montage, text/watermark overlay |
+| `skin_portrait` | Skin and portrait retouching | portrait retouching — skin smoothing, blemish healing, teeth/eye work, slimming |
+| `object_removal` | Object, blemish, or distraction removal | something visible in the original is **gone**, area rebuilt |
+
+Combinations are written the same way, most important first, e.g.
+`color_tonal;white_balance` = "colour grading and tonal correction and white
+balance correction", or `color_tonal;white_balance;crop_perspective` = "…
+and crop, reframing and perspective correction".
+
+The model reports every operation it can actually see, so most final rows carry
+two or three. `crop_perspective` is also added automatically when the two files'
+aspect ratios genuinely differ (orientation alone never counts) — that is a
+*measured* signal, independent of what the model saw.
+
+**Values are canonicalised before they reach a cell.** Whatever the model (or an
+older cache) says — `crop`, `Colour Grade`, `WB`, `sky replacement`,
+`teeth whitening`, `colour grading and retouch` — is mapped onto the eight, so
+a column filter always matches. Unknown terms are dropped. Output order is fixed
+(`color_tonal` first, then `crop_perspective`, …), so re-running a pair writes a
+byte-identical cell.
+
+`title` and `keywords` are shared by the set; `description` differs — the
+original row describes the untouched scene, the final row usually starts with
+`"Same scene with …"` and names only the change.
 
 Example:
 
 | file_id | set_id | edit_state | role | edit_operation |
 |---|---|---|---|---|
 | `_77A0001.CR3` | SET_000001 | 00 | original | |
-| `_77A0001.JPG` | SET_000001 | 01 | final | `color_tonal;retouch` |
+| `_77A0001.JPG` | SET_000001 | 01 | final | `color_tonal;skin_portrait` |
 
 An edit with no matched original still gets one `final` row (classified from its
 own image alone); the run log reports `N set(s) + M single edit(s)`.
 
 **Excel columns** (`sorted_output/photos.xlsx`) — the 17
 `IndiaPix_metadata_template.csv` columns first, in exactly the template order,
-plus the classifier's own `category` appended as an **18th trailing column**:
+then one derived column: `category` (18th):
 
 | Column | Filled with |
 |---|---|
@@ -689,10 +945,10 @@ plus the classifier's own `category` appended as an **18th trailing column**:
 | `role` | `original` or `final` |
 | `edit_operation` | Final rows only: semicolon-separated operations, e.g. `object_removal;color_tonal` |
 | `edit_operation_note` | *blank* |
-| `title` | LLM editorial title (4–10 words, Title Case, no trailing period), shared by the set |
-| `description` | LLM description, no trailing period — original row: the untouched scene (`Woman selecting spices at a market stall, crowd in background`); final row: what changed (`Same scene with background crowd removed and warm color grade`) |
-| `keywords` | LLM keywords, comma-separated, **no space after the commas**, proper names capitalised (`market,spices,woman,India,street`) |
-| `file_format` | `JPEG`, `TIFF`, `NEF`, `CR3`, … (real format; RAW from the extension) |
+| `title` | LLM editorial title — **9–10 meaningful words** (articles *a / an / the* do **not** count towards the 9–10, so the cell may run to 11–13 words in total), sentence case (first word + proper nouns capitalised), no trailing period: `Woman buying fresh spices at a busy Jaipur market stall`. Long answers are trimmed from the end without leaving a dangling article or conjunction, a forbidden `image of` / `photograph of` opener is stripped, and Title Case is folded down. Shared by the set |
+| `description` | LLM description, no trailing period, **one compact sentence of about 20 words** (18–22, hard-capped at 25) — original row: the untouched scene (`Woman selecting spices at a busy Jaipur market stall, warm daylight, crowd behind her`); final row: `Same scene with …`, naming only what changed (`Same scene with the crowd removed and a warmer colour grade`). A longer answer is cut at the first sentence end or at a comma boundary |
+| `keywords` | LLM keywords — **13 to 18**, comma-separated with **no space after the commas**, proper names capitalised (`spice market,turmeric,vendor,woman,saree,India,Jaipur,street,crowd,daylight,warm tones,travel,culture,retail`). A longer list is trimmed to the 18 most specific; a shorter one is topped up from the row's own title/description so the **13-keyword minimum** is always met |
+| `file_format` | **The filename extension**, lowercase — `photo.jpg` → `jpg`, `IMG_0001.CR3` → `cr3`, `scan.tiff` → `tiff`. Taken from the name, never from Pillow (which would say `JPEG`/`MPO` and cannot even open a RAW) |
 | `resolution` | Actual pixel size, e.g. `6000x4000` |
 | `color_space` | `sRGB` / `Adobe RGB` / `ProPhoto RGB` / `Grayscale` / `CMYK` (ICC profile first, then Exif ColorSpace, then PIL mode) |
 | `file_size_mb` | File size in MiB, one decimal |
@@ -736,3 +992,15 @@ to `sorted_output/categorize_debug.log` for debugging.
   folders first.
 - **Loosen or tighten visuals:** raise `--phash-threshold` to accept weaker
   Tier-3 matches, or lower it to be stricter.
+- **Set-folder pairs:** run `sets_pipeline.py --dry-run` first and filter
+  `report.csv` on `confidence`. Rows at `0.35` had no metadata signal at all and
+  were paired by "the later-written file is the edit". If a whole batch scores
+  `0.35`, the client probably stripped EXIF — spot-check a few sets before paying
+  for 40,000 captions.
+- **Run the offline tests** after changing the pairing weights:
+  ```bash
+  python3 tests/test_sets_pipeline.py
+  ```
+  They build synthetic RAW/JPEG/dated/blind pairs and assert the role decision,
+  the 18 columns, the colour coding and the frozen header — no API key
+  and no network needed.

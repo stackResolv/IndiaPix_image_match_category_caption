@@ -90,10 +90,10 @@ def _fill(color):
 class StreamedSheet:
     """Write an arbitrarily large sheet with flat memory (openpyxl write-only).
 
-    ``expected_rows`` sizes the auto-filter range up front, which write-only
-    mode needs because it cannot look back at the sheet afterwards. Rows beyond
-    that number are still written; the auto-filter simply stops at the declared
-    last row.
+    ``expected_rows`` is a pre-flight estimate only: the auto-filter range is
+    finalised in ``close()`` from the rows actually written, so a run that ends
+    up with more (or fewer) rows than planned still leaves the client a filter
+    that covers every row.
     """
 
     def __init__(self, path, columns=None, expected_rows=0, title="Photos"):
@@ -170,6 +170,12 @@ class StreamedSheet:
 
     def close(self):
         """Save the workbook, turning the usual write failures into clear errors."""
+        # write-only mode emits the sheet header at the first append, but the
+        # auto-filter can still be re-stated here, and this is the only place
+        # that knows how many rows were really written.
+        if self.rows_written or self.expected_rows:
+            last = get_column_letter(len(self.columns))
+            self.ws.auto_filter.ref = f"A1:{last}{self.rows_written + 1}"
         try:
             self.wb.save(self.path)
         except PermissionError:
