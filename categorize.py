@@ -212,6 +212,21 @@ PROMPT_PAIR = (
     "You are shown TWO images of the SAME shot.\n"
     "  IMAGE 1 = the ORIGINAL camera file (untouched).\n"
     "  IMAGE 2 = the FINAL delivered edit of that same shot.\n\n"
+    "WORK IN THIS ORDER. Do not skip step 1.\n"
+    "  STEP 1 — DIFF FIRST. Compare the two images and name, before writing "
+    "anything else, everything present in IMAGE 1 that is ABSENT in IMAGE 2: "
+    "wall- or floor-mounted fittings (wiper, brush, holder, towel rail, hook), "
+    "bottles, buckets, bins, boxes, cables, signs, furniture, people, cloths, "
+    "clutter, stains, dust, stray objects - anything present in 1 but absent "
+    "in 2.\n"
+    "  This is the most commonly missed change. Removing something makes a "
+    "scene look \"cleaner\", \"brighter\" or \"better lit\" — that impression "
+    "is very often a REMOVAL dressed up as a lighting change. If a bathroom "
+    "looks tidier, ask yourself what was physically taken off the wall or "
+    "floor before you write \"improved lighting\".\n"
+    "  If anything is gone, edit_operation MUST include object_removal and "
+    "final_description MUST name the object and where it was.\n"
+    "  STEP 2 — write the fields below from that diff.\n\n"
     + _CATEGORY_RULES + _TITLE_RULE + _KEYWORDS_RULE +
     "original_description — ONE sentence of about 20 words (18 to 22, never "
     "more than 25), describing exactly what is visible in IMAGE 1, the "
@@ -270,6 +285,36 @@ PROMPT_REMOVAL_DETAIL = (
     "the desk\" — the specific thing, in the specific place.\n"
     "  If several things went, name the most obvious one. If genuinely nothing "
     "was removed, change edit_operation to what actually happened instead."
+)
+
+
+# The removal SWEEP. A cheap, single-purpose question asked of pairs whose first
+# answer claimed NO removal but described only light/colour - the exact shape of
+# the miss the client reported: a wall-mounted wiper was taken off, the room then
+# looked "cleaner and better lit", and the model wrote "improved lighting and
+# enhanced color tones". That is a removal dressed up as a lighting change.
+#
+# A separate request on purpose: as its own question the model has one job (diff
+# the objects), which is what it skips when asked five things at once.
+PROMPT_REMOVAL_SWEEP = (
+    "Look at the two images ONLY for things that DISAPPEARED.\n"
+    "  IMAGE 1 = the original.  IMAGE 2 = the final edit.\n"
+    "Compare them object by object and list everything present in IMAGE 1 that "
+    "is NOT in IMAGE 2. Look specifically at walls, floors, ceilings, corners, "
+    "shelves, counters and tables for fittings, fixtures, holders, rails, "
+    "hooks, brackets, signs, labels, bottles, buckets, bins, bags, boxes, "
+    "cables, cloths, stains, marks, dust, rubbish and stray objects.\n"
+    "  A removal often leaves a cleaner or better-lit result, so do NOT dismiss "
+    "a change as \"just lighting\" until you have checked what is physically "
+    "absent.\n\n"
+    "Answer ONLY this JSON:\n"
+    '{"removed_objects": "...", "removed_from": "...", "still_present": "yes|no"}\n'
+    "  removed_objects - the concrete things that are gone, named specifically "
+    "(\"the wall-mounted wiper\", \"the blue bucket\", \"the towel rail\"). "
+    "Write \"none\" if nothing was removed.\n"
+    "  removed_from - where each was, in a few words (\"left wall\", \"shelf "
+    "above the counter\"). Empty if nothing was removed.\n"
+    "  still_present - \"no\" if at least one object was removed, else \"yes\"."
 )
 
 
@@ -1526,29 +1571,43 @@ def classify_image(orig_b64, edit_b64, api_key, model, provider="anthropic",
 
 
 def classify_pair(orig_b64, edit_b64, api_key, model, provider="anthropic",
-                  retries=3):
-    """Label a pair, and ask again once if object_removal named nothing removed.
+                  retries=3, sweep=True):
+    """Label a pair, then ask follow-ups for the two documented misses.
 
-    A model can answer `object_removal` while writing "the desk adjusted" - the
-    operation is then unusable, because nothing in the sheet says WHAT went. One
-    extra request, telling the model exactly what it left out, fixes that at the
-    source: it is a few hundredths of a cent, against a human opening the pair.
+    `sweep=True` (the default) also catches the case the client reported: a
+    wall-mounted wiper was taken off, the room then looked cleaner, and the model
+    wrote "improved lighting and enhanced color tones" without ever mentioning a
+    removal. A second, single-purpose question fixes that.
 
-    The second answer is kept only if it actually names something; otherwise the
-    first answer stands and the row is reported as missing detail, so a bad
-    retry cannot make the sheet worse.
+    Both follow-ups can only ever IMPROVE the answer - a bad one leaves the first
+    label standing - so neither can make the sheet worse.
+
+    Returns ``(label, follow_up)`` where `follow_up` is ``''``, ``'detail'`` or
+    ``'sweep'``, for the run log.
     """
     label = classify_image(orig_b64, edit_b64, api_key, model, provider,
                            retries)
-    if not orig_b64 or not remove_detail_needed(label):
-        return label, False
-    retry = classify_image(orig_b64, edit_b64, api_key, model, provider,
-                           retries, extra_prompt=PROMPT_REMOVAL_DETAIL)
-    if remove_detail_needed(retry):
-        return label, False          # retry did not help: keep the first answer
-    if not (retry.get("edit_operation") or "").strip():
-        return label, False          # retry lost the operation: keep the first
-    return retry, True
+    if not orig_b64:
+        return label, ""
+
+    # (a) object_removal with no object named -> ask for the noun.
+    if remove_detail_needed(label):
+        retry = classify_image(orig_b64, edit_b64, api_key, model, provider,
+                               retries, extra_prompt=PROMPT_REMOVAL_DETAIL)
+        if not remove_detail_needed(retry) and \
+                (retry.get("edit_operation") or "").strip():
+            return retry, "detail"
+        return label, ""
+
+    # (b) no removal claimed, but the description only talks about light/colour
+    #     -> ask the single-purpose "what is gone?" question.
+    if sweep and removal_sweep_needed(label):
+        found = classify_image(orig_b64, edit_b64, api_key, model, provider,
+                               retries, extra_prompt=PROMPT_REMOVAL_SWEEP)
+        upgraded = fold_removal_sweep(label, found)
+        if upgraded is not label:
+            return upgraded, "sweep"
+    return label, ""
 
 
 def remove_detail_needed(label):
@@ -1557,6 +1616,80 @@ def remove_detail_needed(label):
         return False
     return removal_detail_missing(label.get("edit_operation", ""),
                                   label.get("final_description", ""))
+
+
+# Descriptions that read like "nothing was taken away". When a first answer is
+# one of these AND claims no object_removal, the removal sweep is worth one cheap
+# call - precisely the shape of the miss reported by the client.
+_LIGHT_ONLY_CUES = (
+    "improved lighting", "better lighting", "enhanced lighting",
+    "improved light", "lighting and", "and enhanced color", "color tone",
+    "colour tone", "color tones", "colour tones", "brighter appearance",
+    "enhanced color", "enhanced colour", "enhanced brightness",
+    "color adjustments", "colour adjustments", "tonal adjustments",
+)
+
+
+def removal_sweep_needed(label):
+    """True if this label claims NO removal but only talks about light/colour.
+
+    That combination is the documented blind spot: a removed fixture leaves the
+    room looking cleaner and better lit, the model describes the *impression*
+    ("Same scene with improved lighting and enhanced color tones"), and the
+    removal never reaches the sheet.
+
+    A row that already names a change beyond light/colour is left alone, and a
+    row that already includes object_removal is handled by
+    `remove_detail_needed` instead.
+    """
+    if not isinstance(label, dict) or label.get("category") == "ERROR":
+        return False
+    if "object_removal" in ops_ordered(label.get("edit_operation", "")):
+        return False
+    desc = _clean_text(label.get("final_description", "")).lower()
+    if not desc:
+        return False
+    return any(cue in desc for cue in _LIGHT_ONLY_CUES)
+
+
+def fold_removal_sweep(label, sweep):
+    """Merge a removal-sweep answer into a label, when it found something.
+
+    The sweep can only ADD a finding: if it says "none", or names a category
+    rather than an object, the original label stands untouched, so a bad sweep
+    can never damage a good row.
+
+    The finding is appended in the client's existing style ("Same scene with
+    improved lighting and the wall-mounted wiper removed"), and `object_removal`
+    is put at the FRONT of the operation list, because it is now the most
+    important thing that happened to the image.
+    """
+    if not isinstance(sweep, dict):
+        return label
+    removed = _clean_text(sweep.get("removed_objects", ""))
+    where = _clean_text(sweep.get("removed_from", ""))
+    if not removed or removed.lower().strip(".") in ("none", "nothing", "no", "nil"):
+        return label
+    # Only accept a CONCRETE object - the same rule the detail check enforces.
+    if not names_removal(f"{removed} removed"):
+        return label
+
+    out = dict(label)
+    # Word order matters for readability: "the wipers removed from the wall",
+    # NOT "the wipers from the wall removed".
+    phrase = (f"{removed} removed from the {where}" if where
+              else f"{removed} removed")
+    desc = _clean_sentence(out.get("final_description", ""))
+    if removed.lower() not in desc.lower():
+        desc = f"{desc} and {phrase}" if desc else phrase.capitalize()
+        out["final_description"] = _normalise_description(desc)
+
+    ops = ops_ordered(out.get("edit_operation", ""))
+    if "object_removal" in ops:
+        ops.remove("object_removal")
+    ops.insert(0, "object_removal")
+    out["edit_operation"] = ";".join(ops)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1708,6 +1841,7 @@ def main():
     results = {}
     done = [0]
     n_asked_again = [0]
+    n_follow_ups = {"detail": 0, "sweep": 0}
 
     def work(fname):
         if fname in cache:
@@ -1720,11 +1854,12 @@ def main():
             orig_b64 = image_to_data_url(orig_path) if orig_path else None
             # classify_pair asks once more when the model used object_removal
             # without naming what went, so the cell is actionable.
-            label, asked_again = classify_pair(orig_b64, edit_b64, api_key,
-                                               model, provider)
-            if asked_again:
+            label, follow_up = classify_pair(orig_b64, edit_b64, api_key,
+                                             model, provider)
+            if follow_up:
                 with lock:
                     n_asked_again[0] += 1
+                    n_follow_ups[follow_up] += 1
         except Exception as e:
             label = _error_label(e)
         with lock:
@@ -1998,19 +2133,23 @@ def main():
         print(safe(f"  object_removal rows          : {n_removal}"), flush=True)
         print(safe(f"  ... asked again to name it   : {n_asked_again[0]}"),
               flush=True)
-        if missing:
-            print(safe(f"  [REVIEW] {len(missing)} object_removal row(s) still do "
-                       f"NOT say what was removed - fix these by hand or re-run "
-                       f"those pairs with --no-cache:"), flush=True)
-            for fname in missing[:10]:
-                print(safe(f"    {fname}: "
-                           f"{results[fname].get('final_description', '')}"),
-                      flush=True)
-            if len(missing) > 10:
-                print(safe(f"    ... and {len(missing) - 10} more"), flush=True)
-        else:
-            print(safe("  [ok] every object_removal row names what was removed"),
+    if n_follow_ups["sweep"]:
+        print(safe(f"  ... removal sweep found one  : {n_follow_ups['sweep']} "
+                   f"row(s) that only said lighting/colour but had something "
+                   f"physically removed"), flush=True)
+    if missing:
+        print(safe(f"  [REVIEW] {len(missing)} object_removal row(s) still do "
+                   f"NOT say what was removed - fix these by hand or re-run "
+                   f"those pairs with --no-cache:"), flush=True)
+        for fname in missing[:10]:
+            print(safe(f"    {fname}: "
+                       f"{results[fname].get('final_description', '')}"),
                   flush=True)
+        if len(missing) > 10:
+            print(safe(f"    ... and {len(missing) - 10} more"), flush=True)
+    elif n_removal:
+        print(safe("  [ok] every object_removal row names what was removed"),
+              flush=True)
     print(safe(f"  open this    : {args.out}"), flush=True)
 
 
