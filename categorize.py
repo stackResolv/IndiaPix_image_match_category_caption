@@ -257,9 +257,19 @@ PROMPT_PAIR = (
 PROMPT_REMOVAL_DETAIL = (
     "Your previous answer used object_removal but did not say WHAT was removed, "
     "so the description cannot be used. Look at the two images again and answer "
-    "the same JSON with final_description naming the missing thing explicitly — "
-    "\"Same scene with the <thing> removed ...\". If nothing was actually "
-    "removed, change edit_operation accordingly instead."
+    "the same JSON with final_description naming the missing thing explicitly.\n"
+    "  Name the ACTUAL OBJECT you can see is gone — its real name, the word you "
+    "would use to describe it to someone who has never seen the photo. Compare "
+    "IMAGE 1 and IMAGE 2 side by side and list what is in 1 but not in 2.\n"
+    "  WRONG (never do this): \"one decorative item removed\", \"a cleaning tool "
+    "removed\", \"some items removed\", \"the clutter cleared\", \"objects "
+    "removed\", \"the product removed\" — these name a CATEGORY, not an object, "
+    "and the row is still unusable.\n"
+    "  RIGHT: \"the wiper removed from the wall\", \"the blue bottle removed "
+    "from the shelf\", \"the second chair removed\", \"the cable removed from "
+    "the desk\" — the specific thing, in the specific place.\n"
+    "  If several things went, name the most obvious one. If genuinely nothing "
+    "was removed, change edit_operation to what actually happened instead."
 )
 
 
@@ -978,27 +988,144 @@ def ops_from_text(text, generic=False):
 # Words that prove a description NAMES something that disappeared. Kept broad so
 # "clutter minimized", "fewer items visible", "tidied away" all count - the point
 # is that a reader learns WHAT went, not the exact verb the model chose.
+# Multi-word cues, mapped onto a single head verb before the word loop runs.
+# The loop matches one word at a time, so a two-word cue ("no longer there",
+# "replaced by") can never be seen for what it is; rewriting the phrase to
+# "removed" puts the object on the correct side of the cue again.
+_REMOVAL_PHRASES = (
+    ("no longer", "removed"),
+    ("replaced by", "removed"),
+    ("replaced with", "removed"),
+    ("swapped for", "removed"),
+    ("swapped with", "removed"),
+    ("instead of", "removed"),
+    ("taken out", "removed"),
+    ("took out", "removed"),
+    ("edited out", "removed"),
+    ("cloned out", "removed"),
+    ("cleaned up", "removed"),
+    ("cleared away", "removed"),
+    ("clearing away", "removed"),
+    ("wiped off", "removed"),
+    ("swept away", "removed"),
+)
+
+# Single-word cues. The noun is looked for BEFORE the cue for a past participle
+# ("the cable REMOVED") and AFTER it for a quantifier ("FEWER bottles").
 _REMOVAL_NAMED = (
     "removed", "remove", "removal", "erased", "deleted", "disappeared", "gone",
-    "no longer", "taken out", "cleared", "cleaned up", "cleaner", "tidied",
-    "tidy", "minimized", "minimised", "fewer", "missing", "dropped",
-    "edited out", "cloned out", "swept", "wiped", "emptied", "without",
-    "replaced by", "swapped for", "changed to", "different",
+    "cleared", "cleaner", "tidied", "tidy", "minimized", "minimised", "fewer",
+    "missing", "dropped", "swept", "wiped", "emptied", "without", "replaced",
+    "swapped",
 )
 
 
-def names_removal(text):
-    """True if `text` tells the reader WHAT disappeared.
+# Nouns that name a CATEGORY, not an object. "one decorative item removed" or
+# "a cleaning tool removed" tells the reader nothing they can act on - the same
+# words would fit a hundred different pairs. A description whose only noun
+# before the removal cue is one of these is treated as missing detail, exactly
+# like a sentence with no cue at all.
+_GENERIC_NOUNS = {
+    "item", "items", "object", "objects", "element", "elements", "thing",
+    "things", "stuff", "clutter", "mess", "debris", "contents", "detail",
+    "details", "area", "areas", "background", "surface", "surfaces", "tool",
+    "tools", "product", "products", "decoration", "decorations", "decor",
+    "piece", "pieces", "container", "containers", "equipment", "supplies",
+    "supply", "material", "materials", "part", "parts", "bit", "bits",
+    "aspect", "feature", "features", "component", "components", "good",
+    "goods", "merchandise", "paraphernalia", "accessory", "accessories",
+    "prop", "props", "fixture", "fixtures", "belonging", "belongings",
+    "offering", "offerings", "set", "sets", "group", "groups", "range",
+    "number", "amount", "everything", "anything", "something", "nothing",
+}
 
-    `object_removal` is only useful if the sentence says what went. "Same scene
-    with the desk adjusted" does not; "Same scene with the cables removed" does.
-    This is the check behind `removal_detail_missing`, so the omission is found
-    automatically instead of by reading 8,000 rows.
-    """
-    low = _clean_text(text).lower()
-    if not low:
+# Words that are structure, not content: they can sit between the noun and the
+# cue ("the SECOND chair MISSING", "a SMALL pile of BOTTLES was cleared").
+_DETERMINERS = {
+    "a", "an", "the", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine", "ten", "some", "few", "several", "many", "most", "all",
+    "any", "each", "every", "both", "other", "another", "more", "less",
+    "small", "large", "larger", "smaller", "big", "bigger", "little", "extra",
+    "additional", "single", "entire", "whole", "main", "minor", "major",
+    "decorative", "cleaning", "various", "certain", "visible", "stray",
+    "loose", "remaining", "unwanted", "one's", "its", "their", "his", "her",
+}
+
+# Cues that are followed by the thing that went ("fewer BOTTLES", "without the
+# CABLE") rather than preceded by it ("the cable was removed").
+# Cues that quantify rather than describe ("fewer BOTTLES", "without the
+# CABLE") name their object AFTER the cue.
+_CUES_FORWARD = {"fewer", "without"}
+
+# Prepositions end a noun phrase. "fewer items ON the counter" means the counter
+# is the LOCATION, not what disappeared, so the forward window stops there.
+_PHRASE_END = {
+    "on", "in", "at", "from", "to", "for", "of", "with", "by", "near",
+    "behind", "under", "above", "below", "beside", "around", "across",
+    "through", "over", "onto", "into", "than", "that", "which",
+}
+
+
+def _is_concrete(word):
+    """True if `word` could name a real object in a photo."""
+    w = word.strip(".,;:!?()[]\"'")
+    if len(w) < 3:
         return False
-    return any(re.search(rf"\b{re.escape(w)}", low) for w in _REMOVAL_NAMED)
+    if w in _GENERIC_NOUNS or w in _DETERMINERS:
+        return False
+    if w.isdigit():
+        return False
+    if w in _DANGLING_WORDS or w in _KEYWORD_STOPWORDS:
+        return False
+    return True
+
+
+def names_removal(text):
+    """True if `text` names an OBJECT that disappeared.
+
+    `object_removal` is only useful if the reader learns *what* went, and a
+    category is not an object:
+
+        "the cables removed"              -> names it
+        "one decorative item removed"     -> does NOT (a category)
+        "a cleaning tool removed"         -> does NOT (a category)
+        "the desk adjusted"               -> does NOT (no removal at all)
+
+    Multi-word cues are rewritten to a single verb first ("no longer there" and
+    "replaced by" both become "removed"), because the word loop below matches one
+    word at a time and those phrases name the object BEFORE the cue.
+
+    Then each cue is checked for a concrete noun in the words around it - before
+    it for "…removed", after it for "fewer…", "without…". This is the check
+    behind `removal_detail_missing`, so the gap is found automatically instead of
+    by reading 8,000 rows.
+    """
+    low = re.sub(r"[^a-z0-9' ]+", " ", _clean_text(text).lower())
+    for phrase, verb in _REMOVAL_PHRASES:
+        # Keep the word count intact so the noun window still looks right, but
+        # collapse the phrase onto its head verb: "no longer" -> "removed".
+        low = re.sub(rf"\b{re.escape(phrase)}\b", verb, low)
+    words = low.split()
+    if not words:
+        return False
+    for i, w in enumerate(words):
+        cue = next((c for c in _REMOVAL_NAMED if w.startswith(c)), "")
+        if not cue:
+            continue
+        if any(w.startswith(c) for c in _CUES_FORWARD):
+            # "FEWER bottles", "WITHOUT the cable": the object follows the cue,
+            # so take the words up to the next preposition. "fewer items ON the
+            # counter" must not count "counter" as the thing that went.
+            window = []
+            for nxt in words[i + 1:i + 5]:
+                if nxt in _PHRASE_END:
+                    break
+                window.append(nxt)
+        else:
+            window = words[max(0, i - 5):i]
+        if any(_is_concrete(x) for x in window):
+            return True
+    return False
 
 
 def removal_detail_missing(ops, description):
