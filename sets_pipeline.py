@@ -225,8 +225,8 @@ def merge_ops(folder_op, model_ops_value, extra_ops=None, hint_text="",
 
     `fallback` is written only when nothing at all was found.
     """
-    cell, _ = cat.explain_ops(folder_op, model_ops_value, extra_ops,
-                              hint_text=hint_text, fallback=fallback)
+    cell, _, _ = cat.explain_ops(folder_op, model_ops_value, extra_ops,
+                                 hint_text=hint_text, fallback=fallback)
     return cell
 
 
@@ -757,6 +757,7 @@ def stage_classify(args, tasks, out_dir):
     lock = threading.Lock()
     state = {"since": 0}
     done_count = [0]
+    n_asked_again = [0]
     t0 = time.time()
 
     def save_cache(force=False):
@@ -777,8 +778,13 @@ def stage_classify(args, tasks, out_dir):
             edit_b64 = cat.image_to_data_url(task["edit_path"])
             orig_b64 = (cat.image_to_data_url(task["orig_path"])
                         if task["orig_path"] else None)
-            label = cat.classify_image(orig_b64, edit_b64, api_key, model,
-                                       provider)
+            # classify_pair re-asks once when the model used object_removal but
+            # never said WHAT was removed, so the cell is actionable.
+            label, asked_again = cat.classify_pair(orig_b64, edit_b64, api_key,
+                                                   model, provider)
+            if asked_again:
+                with lock:
+                    n_asked_again[0] += 1
         except Exception as e:
             label = cat._error_label(e)
         with lock:
@@ -847,6 +853,7 @@ def stage_write(records, tasks, results, out_dir):
     note("invariant: the operation folder's name ALWAYS leads the cell when the "
          "set sits in one - violations are reported, never silent")
     violations = []
+    reviews = []
     op_sources_seen = {}
     n_filled_by_prose = 0
     n_empty_from_model = 0
@@ -879,7 +886,7 @@ def stage_write(records, tasks, results, out_dir):
                  "method", "confidence", "note", "edit_operation", "title",
                  "original_description", "final_description", "keywords",
                  "folder_operation", "op_sources", "model_edit_operation",
-                 "description_used_for_prose"])
+                 "description_used_for_prose", "op_review"])
     try:
         for out_i, ri in enumerate(index, 1):
             r = records[ri]
@@ -905,7 +912,7 @@ def stage_write(records, tasks, results, out_dir):
                 counts[category] = counts.get(category, 0) + 1
                 lone_model_ops = head.get("edit_operation", "")
                 lone_prose = " ".join((head.get("final_description", ""), title))
-                ops, sources = cat.explain_ops(
+                ops, sources, review = cat.explain_ops(
                     folder_op, lone_model_ops,
                     hint_text=lone_prose, fallback="none")
                 for op, why in sources.items():
@@ -914,6 +921,8 @@ def stage_write(records, tasks, results, out_dir):
                     n_empty_from_model += 1
                 if "prose" in sources.values():
                     n_filled_by_prose += 1
+                if review:
+                    reviews.append((set_id, os.path.basename(orig_path), review))
                 if folder_op and not ops.startswith(folder_op):
                     violations.append((set_id, os.path.basename(orig_path),
                                        folder_op, ops))
@@ -931,7 +940,8 @@ def stage_write(records, tasks, results, out_dir):
                              " ".join(f"{op}<-{why}"
                                       for op, why in sources.items()),
                              lone_model_ops,
-                             lone_prose if "prose" in sources.values() else ""])
+                             lone_prose if "prose" in sources.values() else "",
+                             review])
                 continue
 
             # Row 00 — the camera original, describing the untouched scene.
@@ -966,15 +976,18 @@ def stage_write(records, tasks, results, out_dir):
                                   label.get("title", ""), title))
                 # Every term is traced to its source so the debug log can
                 # explain the cell instead of just printing it.
-                ops, sources = cat.explain_ops(folder_op, model_ops, measured,
-                                               hint_text=prose,
-                                               fallback="none")
+                ops, sources, review = cat.explain_ops(
+                    folder_op, model_ops, measured, hint_text=prose,
+                    fallback="none")
                 for op, why in sources.items():
                     op_sources_seen[why] = op_sources_seen.get(why, 0) + 1
                 if not (model_ops or "").strip():
                     n_empty_from_model += 1
                 if "prose" in sources.values():
                     n_filled_by_prose += 1
+                if review:
+                    reviews.append((set_id,
+                                    os.path.basename(r["files"][ei]), review))
                 # INVARIANT: a set inside an operation folder must lead with
                 # that folder's own text. Anything else means the client's
                 # label was lost, and is reported, never ignored.
@@ -1004,7 +1017,8 @@ def stage_write(records, tasks, results, out_dir):
                              " ".join(f"{op}<-{why}"
                                       for op, why in sources.items()),
                              model_ops,
-                             prose if "prose" in sources.values() else ""])
+                             prose if "prose" in sources.values() else "",
+                             review])
     finally:
         dbg.close()
 
@@ -1037,6 +1051,56 @@ def stage_write(records, tasks, results, out_dir):
     else:
         log("[ok] every set that sits in an operation folder leads its cell "
             "with that folder's name, verbatim")
+
+    # ---- rows where the model and its own description disagree ---------- #
+    # The only cells where "performed" is genuinely in doubt: the model named
+    # one operation, its own sentence names another. Guessing was what the
+    # client rejected, so these are listed instead - each is a two-second check
+    # against the pair.
+    if reviews:
+        log(f"[REVIEW] {len(reviews):,} row(s) where the description names an "
+            f"operation the model did not report - the cell keeps the model's "
+            f"answer and is flagged for a human:")
+        for sid, fname, why in reviews[:10]:
+            log(f"{sid}/{fname}: {why}", indent=4)
+        if len(reviews) > 10:
+            log(f"... and {len(reviews) - 10} more "
+                f"(filter op_review in categorize_debug.log)", indent=4)
+    else:
+        log("[ok] the model's answer and the description agree on every row")
+
+    # ---- object_removal rows that still do not say WHAT went ------------ #
+    # "object_removal" is useless on its own: the client needs to know what
+    # disappeared. The prompt demands it and a miss is asked once more, so this
+    # should be empty. When it is not, the rows are listed by name.
+    n_removal = 0
+    missing = []
+    for r in records:
+        for ei in r["edit_is"] or [r["orig_i"]]:
+            key = task_key(r["set"], r["files"][ei],
+                           "" if not r["edit_is"] else r["files"][r["orig_i"]])
+            label = results.get(key) or {}
+            ops = label.get("edit_operation", "")
+            if "object_removal" not in cat.ops_ordered(ops):
+                continue
+            n_removal += 1
+            if cat.removal_detail_missing(
+                    ops, label.get("final_description", "")):
+                missing.append((r.get("set_id", ""),
+                                os.path.basename(r["files"][ei]),
+                                label.get("final_description", "")))
+    if n_removal:
+        log(f"  object_removal rows: {n_removal:,}")
+        if missing:
+            log(f"[REVIEW] {len(missing):,} object_removal row(s) still do NOT "
+                f"say what was removed:")
+            for sid, fname, desc in missing[:10]:
+                log(f"{sid}/{fname}: {desc}", indent=4)
+            if len(missing) > 10:
+                log(f"... and {len(missing) - 10} more "
+                    f"(see categorize_debug.log)", indent=4)
+        else:
+            log("[ok] every object_removal row names what was removed")
     return counts, xlsx_path, debug_path
 
 

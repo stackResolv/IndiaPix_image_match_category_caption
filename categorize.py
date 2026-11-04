@@ -224,7 +224,13 @@ PROMPT_PAIR = (
     "\"Same scene with \" and name only what changed (e.g. \"Same scene with "
     "the crowd removed and a warmer colour grade\"). If the framing or subject "
     "changed substantially, describe the result directly instead. No trailing "
-    "period.\n\n"
+    "period.\n"
+    "  IMPORTANT — if edit_operation includes object_removal, this sentence "
+    "MUST name the thing that disappeared, in plain words: \"the bin removed\", "
+    "\"the cable gone\", \"the second chair missing\", \"the clutter cleared "
+    "from the desk\". A description that says only \"the desk adjusted\" or "
+    "\"items rearranged\" does not say WHAT went, and that row is unusable. If "
+    "several things went, name the most obvious one (or two).\n\n"
     "edit_operation — one or more operations, semicolon-separated, most "
     "important first, chosen ONLY from this vocabulary: " +
     "; ".join(EDIT_OPS) + ".\n"
@@ -243,6 +249,19 @@ PROMPT_PAIR = (
     '"original_description": "...", "final_description": "...", '
     '"edit_operation": "..."}'
 )
+
+# Appended to the pair prompt when a first answer used object_removal without
+# naming anything that went. Asking once more, with the omission spelled out, is
+# far cheaper than reviewing 8,000 rows by hand and fixes the cause rather than
+# only reporting the symptom.
+PROMPT_REMOVAL_DETAIL = (
+    "Your previous answer used object_removal but did not say WHAT was removed, "
+    "so the description cannot be used. Look at the two images again and answer "
+    "the same JSON with final_description naming the missing thing explicitly — "
+    "\"Same scene with the <thing> removed ...\". If nothing was actually "
+    "removed, change edit_operation accordingly instead."
+)
+
 
 # ---- prompt used when an edit has NO matched original ---------------------- #
 PROMPT_SINGLE = (
@@ -809,121 +828,132 @@ def dominant_op(value):
 # --------------------------------------------------------------------------- #
 # Prose cues — the model's own description of the change is evidence too
 # --------------------------------------------------------------------------- #
-# A vision model sometimes answers every field except edit_operation (or names
-# only the most obvious operation). Its final_description, however, usually
-# says what happened in plain words: "Same scene with the crowd removed and a
-# warmer colour grade". Reading that sentence back gives the client a filled
-# cell instead of a blank one, and adds the operations the model did not list.
+# The client asks for two things at once, and they pull in opposite directions:
 #
-# The cues are split because they carry different weight:
+#   * never list an operation that was NOT performed  -> do not invent;
+#   * never omit one that WAS performed               -> do not under-report.
 #
-#   _OP_CUES_STRONG  name a concrete, visible piece of work (an object removed,
-#                    a backdrop swapped, the frame cropped). Worth adding even
-#                    beside a model answer: that is how a cell ends up naming
-#                    every operation the pair actually shows.
-#   _OP_CUES_GENERIC only say "something was tweaked" ("slightly adjusted",
-#                    "warmer"). Used solely to fill a cell that would otherwise
-#                    be blank, so a real answer is never padded with filler.
+# The only evidence available is the model's own output. Its final_description
+# describes the change in plain English ("Same scene with the crowd removed and
+# a warmer colour grade"), and vision models routinely under-report the short
+# `edit_operation` enum while describing the work correctly in that sentence.
+# So the sentence is read — but ONLY for words that state work was DONE:
 #
-# A phrase that says nothing happened suppresses both, so the cell is told the
-# truth ("none") rather than invented.
+#   _OP_CUES_CERTAIN  an explicit performed-work verb: removed, added, cropped,
+#                     retouched, background replaced, greys neutralised, …
+#                     Corroborates the model and fills gaps it left.
+#   _OP_CUES_VAGUE    says the frame was worked on but not how: "adjusted",
+#                     "slightly altered", "minor edits", "rearranged".
+#                     Used ONLY to fill a cell that would otherwise be blank —
+#                     mapping a vague word onto a specific operation is a guess,
+#                     so it must never be added beside a real answer.
+#
+# Deliberately absent: STATE descriptors ("visible", "placed on", "positioned",
+# "stacked", "in the background", "on the table"). They say what is in the
+# frame, not what was done to it — reading them as work is exactly what used to
+# report `compositing` for "dust visible on the desk" and "cup placed on a
+# coaster". They are never used, at any tier.
+#
+# A phrase that says nothing happened suppresses every tier, so the cell is told
+# the truth ("none") instead of being invented.
 _NO_CHANGE_CUES = (
     "no visible change", "no visible changes", "no change", "no changes",
     "unchanged", "identical", "nothing changed", "no discernible",
     "no noticeable change", "pixel dimensions only",
 )
 
-_OP_CUES_STRONG = (
-    # something disappeared, was taken out, or was put somewhere else
+_OP_CUES_CERTAIN = (
+    # work that makes something disappear
     ("object_removal", (
         "removed", "remove", "removal", "erased", "erasing", "deleted",
         "disappeared", "gone", "no longer there", "taken out", "cloned out",
-        "cleaned up", "cleaning up", "spot healed", "dust spot",
-        "dust spots", "dust removal", "dust removed", "dusted off",
+        "cleaned up", "cleaning up", "spot healed", "spot healed out",
+        "dust removed", "dust spot removed", "dusted off",
     )),
-    # something was ADDED, moved or rearranged: the composition changed
+    # work that puts something in, or combines frames
     ("compositing", (
-        "added", "adding", "additional", "extra", "inserted", "pasted",
-        "combined", "composite", "merged", "overlaid", "overlay", "watermark",
-        "double exposure", "new element", "introduced", "sky replacement",
-        "sky swapped", "element added", "logo added", "text added",
+        "added", "adding", "inserted", "pasted", "combined", "composite",
+        "merged", "overlaid", "overlay", "watermark", "double exposure",
+        "new element", "element added", "logo added", "text added",
         "graphic added", "number changed", "design changed", "label changed",
         "text changed", "sign changed", "pattern changed", "logo changed",
-        "screen turned off", "screen turned on", "screen replaced",
-        "turned off", "turned on", "more visibly", "more prominently",
-        "no longer visible",
-        # Rearranging is not a removal - the same items are all still there,
-        # only their placement changed, which is a composition change.
-        "repositioned", "re arranged", "rearranged", "moved", "shifted",
-        "different arrangement", "arranged differently", "swapped places",
+        "screen replaced", "sky replacement", "sky swapped", "introduced",
     )),
-    # the backdrop itself changed
+    # the backdrop itself was worked on
     ("background", (
         "background replaced", "background removed", "background cleaned",
         "background changed", "background blurred", "background extended",
-        "background swapped", "backdrop", "white background", "plain white",
-        "cut out", "cutout", "studio background", "isolated on white",
+        "background swapped", "background swapped out", "backdrop replaced",
+        "backdrop changed", "cut out", "cutout", "isolated on white",
+        "white background added",
     )),
-    # skin / face / body work
+    # work on a person's skin / face / body
     ("skin_portrait", (
-        "skin", "blemish", "retouch", "teeth", "whitened", "eyes brightened",
-        "eye brightened", "complexion", "smoothing of the face", "hair cleanup",
-        "makeup", "figure slimmed", "body reshaped", "liquify",
+        "skin retouched", "skin smoothed", "skin smoothing", "blemish healed",
+        "blemish removed", "retouched", "retouch", "teeth whitened",
+        "eyes brightened", "eye brightened", "complexion smoothed",
+        "hair cleaned", "hair cleanup", "makeup applied", "figure slimmed",
+        "body reshaped", "liquified", "liquify",
     )),
-    # the frame changed
+    # the frame itself was changed
     ("crop_perspective", (
-        "cropped", "crop", "re framed", "reframed", "framing", "straightened",
-        "rotated", "perspective", "aspect ratio", "tighter frame",
-        "wider frame", "lens correction", "horizon", "keystone",
+        "cropped", "crop", "reframed", "re framed", "straightened", "rotated",
+        "perspective corrected", "perspective correction", "aspect ratio",
+        "tighter frame", "tighter crop", "wider frame", "lens corrected",
+        "lens correction", "horizon straightened", "keystone corrected",
     )),
-    # colour cast only
+    # colour cast corrected
     ("white_balance", (
-        "white balance", "colour cast", "color cast", "yellow cast",
-        "blue cast", "warmer cast", "cooler cast", "colour temperature",
-        "color temperature", "neutralised", "neutralized", "tint corrected",
+        "white balance", "colour cast removed", "color cast removed",
+        "yellow cast", "blue cast", "warmer cast", "cooler cast",
+        "colour temperature", "color temperature", "neutralised",
+        "neutralized", "tint corrected", "white balanced",
     )),
-    # detail only
+    # detail handling
     ("sharpen_denoise", (
-        "sharpened", "sharper", "sharpen", "denoised", "noise reduced",
-        "grain reduced", "clarity", "more detail", "micro contrast",
-        "texture enhanced",
+        "sharpened", "sharpen", "denoised", "noise reduced", "grain reduced",
+        "clarity added", "micro contrast", "texture enhanced",
     )),
-)
-
-# Read ONLY to fill a cell that would otherwise be blank: the model described a
-# change without naming a concrete one ("cup placed on a coaster", "gift pack
-# visible"), and the plainest reading is that an element arrived or moved.
-_OP_CUES_WEAK = (
-    ("compositing", (
-        "placed", "positioned", "stacked", "visible", "appeared", "wrapped in",
-        "on the table", "in the background", "more centrally",
-    )),
-)
-
-_OP_CUES_GENERIC = (
+    # colour / tone grading
     ("color_tonal", (
-        "colour grade", "color grade", "colour graded", "color graded",
-        "grading", "warmer", "cooler", "brighter", "darker", "lighter",
-        "more vivid", "saturation", "contrast", "vibrance", "tonal", "tone",
-        "mood", "vignette", "black and white", "monochrome", "sepia",
-        "exposure", "colour", "color", "light", "adjusted", "adjustment",
-        "adjustments", "tweaked", "tweak", "polished", "enhanced",
-        # Vague, but they do say the frame was worked on: "slightly altered",
-        # "minor edits", "the design changed". Only ever used to fill an empty
-        # cell, never beside a real answer.
+        "colour graded", "color graded", "colour grade", "color grade",
+        "colour grading", "color grading", "black and white", "monochrome",
+        "sepia toned", "vignette added", "tone mapped", "lut applied",
+    )),
+)
+
+# Vague, but they do say the frame was worked on. FILL-ONLY: mapping one of
+# these onto a specific operation is a guess, so it is never added beside a
+# real answer - only used when the cell would otherwise be empty.
+_OP_CUES_VAGUE = (
+    ("color_tonal", (
+        "adjusted", "adjustment", "adjustments", "tweaked", "tweak",
         "altered", "changed", "minor edit", "minor edits", "edited",
+        "polished", "enhanced", "brighter", "darker", "warmer", "cooler",
+        "lighter", "more vivid", "saturation", "contrast", "vibrance",
+        "tonal", "tone", "mood", "exposure", "colour", "color", "light",
+    )),
+    ("compositing", (
+        "repositioned", "re arranged", "rearranged", "moved", "shifted",
+        "different arrangement", "arranged differently", "swapped places",
     )),
 )
 
 
 def ops_from_text(text, generic=False):
-    """The operations a piece of prose names, most specific first.
+    """The operations a piece of prose proves were performed.
 
-    Used on the label's own final_description/title, so a model that forgot to
-    fill edit_operation still gets an honest cell: its sentence said "the crowd
-    removed and a warmer colour grade", which IS the answer. `generic=False`
-    reads only the strong cues (concrete work); `generic=True` also reads the
-    "something was tweaked" cues, which are only worth using to fill a cell.
+    `generic=False` (the default) reads only the CERTAIN verbs — explicit work
+    such as removed / added / cropped / retouched. That tier is safe to add
+    beside a model answer, which is how a performed operation the model forgot
+    to list still reaches the sheet.
+
+    `generic=True` additionally reads the VAGUE tier ("slightly adjusted",
+    "rearranged") and is therefore only used to fill a cell that is otherwise
+    empty: a vague word cannot prove WHICH operation was performed.
+
+    State descriptors ("visible", "placed on") are never read at either tier —
+    they describe the scene, not the work done to it.
     """
     low = _clean_text(text).lower()
     if not low:
@@ -934,8 +964,8 @@ def ops_from_text(text, generic=False):
     if any(cue in low for cue in _NO_CHANGE_CUES):
         return []
     out = []
-    tables = ((_OP_CUES_STRONG, _OP_CUES_WEAK, _OP_CUES_GENERIC) if generic
-              else (_OP_CUES_STRONG,))
+    tables = ((_OP_CUES_CERTAIN, _OP_CUES_VAGUE) if generic
+              else (_OP_CUES_CERTAIN,))
     for table in tables:
         for op, cues in table:
             if op in out:
@@ -943,6 +973,45 @@ def ops_from_text(text, generic=False):
             if any(re.search(rf"\b{re.escape(cue)}", low) for cue in cues):
                 out.append(op)
     return out
+
+
+# Words that prove a description NAMES something that disappeared. Kept broad so
+# "clutter minimized", "fewer items visible", "tidied away" all count - the point
+# is that a reader learns WHAT went, not the exact verb the model chose.
+_REMOVAL_NAMED = (
+    "removed", "remove", "removal", "erased", "deleted", "disappeared", "gone",
+    "no longer", "taken out", "cleared", "cleaned up", "cleaner", "tidied",
+    "tidy", "minimized", "minimised", "fewer", "missing", "dropped",
+    "edited out", "cloned out", "swept", "wiped", "emptied", "without",
+    "replaced by", "swapped for", "changed to", "different",
+)
+
+
+def names_removal(text):
+    """True if `text` tells the reader WHAT disappeared.
+
+    `object_removal` is only useful if the sentence says what went. "Same scene
+    with the desk adjusted" does not; "Same scene with the cables removed" does.
+    This is the check behind `removal_detail_missing`, so the omission is found
+    automatically instead of by reading 8,000 rows.
+    """
+    low = _clean_text(text).lower()
+    if not low:
+        return False
+    return any(re.search(rf"\b{re.escape(w)}", low) for w in _REMOVAL_NAMED)
+
+
+def removal_detail_missing(ops, description):
+    """True when a row claims object_removal but never says what was removed.
+
+    Those rows are the ones a reviewer cannot act on: the operation says
+    something disappeared, the sentence does not say what, and nothing in the
+    sheet lets anyone find out without opening the pair. They are counted,
+    listed, and (when a model is available) asked once more.
+    """
+    if "object_removal" not in ops_ordered(ops):
+        return False
+    return not names_removal(description)
 
 
 def complete_ops(model_ops, hint_text="", measured=None, fallback=""):
@@ -973,13 +1042,74 @@ def complete_ops(model_ops, hint_text="", measured=None, fallback=""):
     return ";".join(parts) if parts else fallback
 
 
+# Operations that describe the SAME aspect of an image, in mutually exclusive
+# directions. "something was removed" and "something was added" cannot both be
+# the story of one pair; neither can "colour graded" and "colour cast
+# corrected". A description that names the opposite direction from the model is
+# a contradiction to flag, NOT a second operation to append.
+_OP_AXIS = {
+    "object_removal": "objects",
+    "compositing": "objects",
+    "color_tonal": "colour",
+    "white_balance": "colour",
+    "background": "backdrop",
+    "crop_perspective": "frame",
+    "sharpen_denoise": "detail",
+    "skin_portrait": "skin",
+}
+
+
+def _axis_taken(ops):
+    """{axis: op} for the operations already in the cell."""
+    out = {}
+    for op in ops:
+        axis = _OP_AXIS.get(op)
+        if axis and axis not in out:
+            out[axis] = op
+    return out
+
+
+def op_review(cell_ops, model_ops, hint_text="", conflict=()):
+    """Explain any place the model and its own description name opposing work.
+
+    `conflict` is the list of `(prose_op, model_op)` pairs that `explain_ops`
+    refused to merge because they sit on the same axis pointing opposite ways -
+    the classic case, seen in real data::
+
+        model : object_removal
+        prose : "Same scene with scissors added on the desk"
+
+    One picture, one change. Calling it both a removal and an addition would be
+    asserting two facts that cannot both hold, which is exactly the "lists an
+    operation that was not performed" failure the client rejected. So the
+    description's term is NOT written; the row is listed instead and a human
+    settles it in seconds by looking at the pair.
+
+    Returns ``''`` when nothing conflicts.
+    """
+    if not conflict:
+        return ""
+    parts = [f"description says {p} where the model says {m}"
+             for p, m in conflict]
+    return "; ".join(parts) + " - review"
+
+
 def explain_ops(folder_op="", model_ops="", measured=None, hint_text="",
                 fallback=""):
     """The same decision as `merge_ops`/`complete_ops`, with its evidence laid out.
 
-    Returns ``(cell, sources)`` where `sources` names exactly where each term
-    came from. Every row is logged this way, so a reviewer can see why a cell
-    reads what it reads instead of having to re-run the model.
+    Returns ``(cell, sources, review)``:
+
+      ``cell``    the value written to the spreadsheet, folder name first;
+      ``sources`` which term came from where (`folder` / `model` / `measured` /
+                  `prose` / `fallback`), for the debug log;
+      ``review``  a non-empty reason when the model's answer and the label's own
+                  description disagree, so the row can be settled by a human.
+
+    The description may only ADD a term when the model produced nothing at all.
+    Anything else it names beyond the model's answer becomes a `review` line
+    instead of an extra term — which is how a performed operation is surfaced
+    without inventing one.
     """
     sources = {}
     parts = []
@@ -1001,12 +1131,42 @@ def explain_ops(folder_op="", model_ops="", measured=None, hint_text="",
     for op in measured or []:
         if op not in already:
             push(op, "measured")
+
+    # The CERTAIN tier ADDS: an explicit performed-work verb ("the crowd
+    # removed", "cropped tighter") proves that operation was done, whether or
+    # not the model listed it. This is how a performed operation the model
+    # forgot still reaches the sheet. Nothing is guessed here - the sentence
+    # states the work.
+    #
+    # The one exception is an OPPOSITE on the same axis: if the model already
+    # says something was removed, a description saying something was added is
+    # not extra work, it is a disagreement about the same change. Appending it
+    # would state that both happened, which is the invention the client
+    # rejected - so it is recorded as a conflict for a human instead.
+    conflict = []
+    axes = _axis_taken(parts)
+    for op in ops_from_text(hint_text):
+        if op in parts or op in already:
+            continue
+        axis = _OP_AXIS.get(op)
+        if axis and axis in axes:
+            conflict.append((op, axes[axis]))
+            continue
+        push(op, "prose")
+        if axis:
+            axes.setdefault(axis, op)
+
     if not parts:
+        # Nothing anywhere -> fall back to the vague tier, then to the caller's
+        # sentinel. A vague word cannot prove WHICH operation was performed, so
+        # it is only ever used when there is no other evidence at all.
         for op in ops_from_text(hint_text, generic=True):
             push(op, "prose")
     if not parts:
         push(fallback or "none", "fallback")
-    return ";".join(parts), sources
+
+    return ";".join(parts), sources, op_review(";".join(parts), model_ops,
+                                               hint_text, conflict)
 
 
 def _error_label(msg=""):
@@ -1157,8 +1317,11 @@ def _openai_content(orig_b64, edit_b64, prompt):
     return content
 
 
-def _classify_anthropic(orig_b64, edit_b64, api_key, model, retries=3):
+def _classify_anthropic(orig_b64, edit_b64, api_key, model, retries=3,
+                        extra_prompt=""):
     prompt = PROMPT_PAIR if orig_b64 else PROMPT_SINGLE
+    if extra_prompt:
+        prompt = prompt + "\n\n" + extra_prompt
     headers = {
         "x-api-key": api_key,
         "anthropic-version": ANTHROPIC_VERSION,
@@ -1191,8 +1354,11 @@ def _classify_anthropic(orig_b64, edit_b64, api_key, model, retries=3):
     return _error_label("no response")
 
 
-def _classify_openai(orig_b64, edit_b64, api_key, model, retries=3):
+def _classify_openai(orig_b64, edit_b64, api_key, model, retries=3,
+                     extra_prompt=""):
     prompt = PROMPT_PAIR if orig_b64 else PROMPT_SINGLE
+    if extra_prompt:
+        prompt = prompt + "\n\n" + extra_prompt
     headers = {"Authorization": f"Bearer {api_key}",
                "Content-Type": "application/json"}
     payload = {
@@ -1224,10 +1390,46 @@ def _classify_openai(orig_b64, edit_b64, api_key, model, retries=3):
 
 
 def classify_image(orig_b64, edit_b64, api_key, model, provider="anthropic",
-                   retries=3):
+                   retries=3, extra_prompt=""):
     if provider == "openai":
-        return _classify_openai(orig_b64, edit_b64, api_key, model, retries)
-    return _classify_anthropic(orig_b64, edit_b64, api_key, model, retries)
+        return _classify_openai(orig_b64, edit_b64, api_key, model, retries,
+                                extra_prompt)
+    return _classify_anthropic(orig_b64, edit_b64, api_key, model, retries,
+                               extra_prompt)
+
+
+def classify_pair(orig_b64, edit_b64, api_key, model, provider="anthropic",
+                  retries=3):
+    """Label a pair, and ask again once if object_removal named nothing removed.
+
+    A model can answer `object_removal` while writing "the desk adjusted" - the
+    operation is then unusable, because nothing in the sheet says WHAT went. One
+    extra request, telling the model exactly what it left out, fixes that at the
+    source: it is a few hundredths of a cent, against a human opening the pair.
+
+    The second answer is kept only if it actually names something; otherwise the
+    first answer stands and the row is reported as missing detail, so a bad
+    retry cannot make the sheet worse.
+    """
+    label = classify_image(orig_b64, edit_b64, api_key, model, provider,
+                           retries)
+    if not orig_b64 or not remove_detail_needed(label):
+        return label, False
+    retry = classify_image(orig_b64, edit_b64, api_key, model, provider,
+                           retries, extra_prompt=PROMPT_REMOVAL_DETAIL)
+    if remove_detail_needed(retry):
+        return label, False          # retry did not help: keep the first answer
+    if not (retry.get("edit_operation") or "").strip():
+        return label, False          # retry lost the operation: keep the first
+    return retry, True
+
+
+def remove_detail_needed(label):
+    """True if this label used object_removal without naming the removed thing."""
+    if not isinstance(label, dict) or label.get("category") == "ERROR":
+        return False
+    return removal_detail_missing(label.get("edit_operation", ""),
+                                  label.get("final_description", ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -1378,6 +1580,7 @@ def main():
     lock = threading.Lock()
     results = {}
     done = [0]
+    n_asked_again = [0]
 
     def work(fname):
         if fname in cache:
@@ -1388,7 +1591,13 @@ def main():
             edit_b64 = image_to_data_url(os.path.join(args.edit_dir, fname))
             orig_path = originals.get(fname, "")
             orig_b64 = image_to_data_url(orig_path) if orig_path else None
-            label = classify_image(orig_b64, edit_b64, api_key, model, provider)
+            # classify_pair asks once more when the model used object_removal
+            # without naming what went, so the cell is actionable.
+            label, asked_again = classify_pair(orig_b64, edit_b64, api_key,
+                                               model, provider)
+            if asked_again:
+                with lock:
+                    n_asked_again[0] += 1
         except Exception as e:
             label = _error_label(e)
         with lock:
@@ -1637,12 +1846,44 @@ def main():
     if counts.get("ERROR"):
         print(safe(f"    {'ERROR':22s}: {counts['ERROR']}"), flush=True)
     print("  " + hr("-"), flush=True)
+    # ---- object_removal rows that still do not say WHAT went ------------ #
+    # The prompt now demands it and a miss is asked once more, so this should be
+    # empty. When it is not, the row is listed rather than shipped looking
+    # finished: an object_removal whose description says only "the desk
+    # adjusted" cannot be acted on.
+    missing = []
+    n_removal = 0
+    for fname in sorted_edits:
+        ops = results[fname].get("edit_operation", "")
+        if "object_removal" not in ops_ordered(ops):
+            continue
+        n_removal += 1
+        if removal_detail_missing(ops, results[fname].get("final_description", "")):
+            missing.append(fname)
+
     print(safe(f"  rows written : {len(excel_rows)} "
                f"({len(set_order)} set(s) + {n_singles} single edit(s)) "
                f"x {len(all_columns)} columns "
                f"({len(TEMPLATE_COLUMNS)} template + "
                f"{len(EXTRA_COLUMNS)} extra: {', '.join(EXTRA_COLUMNS)})"),
           flush=True)
+    if n_removal:
+        print(safe(f"  object_removal rows          : {n_removal}"), flush=True)
+        print(safe(f"  ... asked again to name it   : {n_asked_again[0]}"),
+              flush=True)
+        if missing:
+            print(safe(f"  [REVIEW] {len(missing)} object_removal row(s) still do "
+                       f"NOT say what was removed - fix these by hand or re-run "
+                       f"those pairs with --no-cache:"), flush=True)
+            for fname in missing[:10]:
+                print(safe(f"    {fname}: "
+                           f"{results[fname].get('final_description', '')}"),
+                      flush=True)
+            if len(missing) > 10:
+                print(safe(f"    ... and {len(missing) - 10} more"), flush=True)
+        else:
+            print(safe("  [ok] every object_removal row names what was removed"),
+                  flush=True)
     print(safe(f"  open this    : {args.out}"), flush=True)
 
 
