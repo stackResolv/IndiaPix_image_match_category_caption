@@ -153,8 +153,8 @@ _OP_GUIDE = (
     "cast removed, an orange/warm cast added, a yellow-green cast neutralised so "
     "whites and greys read neutral. Contrast and saturation look unchanged.\n"
     "- object_removal — something clearly visible in IMAGE 1 is GONE in IMAGE 2: "
-    "a person, animal, bin, cable, sign, dust spot or stray object has been made "
-    "to disappear and the area behind it rebuilt.\n"
+    "the place it occupied is now empty or shows the surface behind it, and that "
+    "area has been rebuilt. Moved, recoloured or partly hidden is NOT this.\n"
     "- sharpen_denoise — detail handling only: extra sharpening, clarity, "
     "texture or micro-contrast, or the opposite — noise/grain reduction and "
     "smoothing that removes speckle while keeping edges crisp.\n"
@@ -213,19 +213,24 @@ PROMPT_PAIR = (
     "  IMAGE 1 = the ORIGINAL camera file (untouched).\n"
     "  IMAGE 2 = the FINAL delivered edit of that same shot.\n\n"
     "WORK IN THIS ORDER. Do not skip step 1.\n"
-    "  STEP 1 — DIFF FIRST. Compare the two images and name, before writing "
-    "anything else, everything present in IMAGE 1 that is ABSENT in IMAGE 2: "
-    "wall- or floor-mounted fittings (wiper, brush, holder, towel rail, hook), "
-    "bottles, buckets, bins, boxes, cables, signs, furniture, people, cloths, "
-    "clutter, stains, dust, stray objects - anything present in 1 but absent "
-    "in 2.\n"
-    "  This is the most commonly missed change. Removing something makes a "
-    "scene look \"cleaner\", \"brighter\" or \"better lit\" — that impression "
-    "is very often a REMOVAL dressed up as a lighting change. If a bathroom "
-    "looks tidier, ask yourself what was physically taken off the wall or "
-    "floor before you write \"improved lighting\".\n"
+    "  STEP 1 — DIFF FIRST. Before writing any field, scan IMAGE 1 against "
+    "IMAGE 2 and list what is present in IMAGE 1 but ABSENT in IMAGE 2.\n"
+    "  Work by SCAN, not by memory of what rooms usually contain:\n"
+    "    - divide IMAGE 1 into a 3x3 grid (top/middle/bottom x left/centre/"
+    "right);\n"
+    "    - in each cell, look at what is actually pictured;\n"
+    "    - look at the SAME cell in IMAGE 2 and ask: is that still there?\n"
+    "    - something is missing only if the place it occupied is now empty or "
+    "shows the surface behind it. Moved, recoloured, or partly hidden is NOT "
+    "missing.\n"
+    "  Name what you see, by its own shape/colour/material. Never name a thing "
+    "just because it is common in that kind of scene.\n"
+    "  This is the most commonly missed change: removing something makes a "
+    "scene look \"cleaner\", \"brighter\" or \"better lit\", and that impression "
+    "is very often a REMOVAL disguised as a lighting change. Before writing "
+    "\"improved lighting\", check what was physically taken away.\n"
     "  If anything is gone, edit_operation MUST include object_removal and "
-    "final_description MUST name the object and where it was.\n"
+    "final_description MUST name each missing object and where it was.\n"
     "  STEP 2 — write the fields below from that diff.\n\n"
     + _CATEGORY_RULES + _TITLE_RULE + _KEYWORDS_RULE +
     "original_description — ONE sentence of about 20 words (18 to 22, never "
@@ -241,11 +246,12 @@ PROMPT_PAIR = (
     "changed substantially, describe the result directly instead. No trailing "
     "period.\n"
     "  IMPORTANT — if edit_operation includes object_removal, this sentence "
-    "MUST name the thing that disappeared, in plain words: \"the bin removed\", "
-    "\"the cable gone\", \"the second chair missing\", \"the clutter cleared "
-    "from the desk\". A description that says only \"the desk adjusted\" or "
-    "\"items rearranged\" does not say WHAT went, and that row is unusable. If "
-    "several things went, name the most obvious one (or two).\n\n"
+    "MUST name each thing that disappeared, in plain words, and say where it "
+    "was. Name the object as you SEE it (its shape, colour, material) - never a "
+    "category and never a thing that merely looks typical for the room. A "
+    "description that says only \"the desk adjusted\" or \"items rearranged\" "
+    "does not say WHAT went, and that row is unusable. If several things went, "
+    "name them all.\n\n"
     "edit_operation — one or more operations, semicolon-separated, most "
     "important first, chosen ONLY from this vocabulary: " +
     "; ".join(EDIT_OPS) + ".\n"
@@ -276,45 +282,95 @@ PROMPT_REMOVAL_DETAIL = (
     "  Name the ACTUAL OBJECT you can see is gone — its real name, the word you "
     "would use to describe it to someone who has never seen the photo. Compare "
     "IMAGE 1 and IMAGE 2 side by side and list what is in 1 but not in 2.\n"
-    "  WRONG (never do this): \"one decorative item removed\", \"a cleaning tool "
-    "removed\", \"some items removed\", \"the clutter cleared\", \"objects "
-    "removed\", \"the product removed\" — these name a CATEGORY, not an object, "
-    "and the row is still unusable.\n"
-    "  RIGHT: \"the wiper removed from the wall\", \"the blue bottle removed "
-    "from the shelf\", \"the second chair removed\", \"the cable removed from "
-    "the desk\" — the specific thing, in the specific place.\n"
+    "  WRONG: a word that names a whole CLASS of thing rather than the object "
+    "you can see (a generic \"item\", \"tool\", \"product\", \"clutter\", "
+    "\"object\"), or a thing that merely looks typical for that kind of room. "
+    "Either way the row is still unusable.\n"
+    "  RIGHT: describe the actual thing you see - its shape, colour, material "
+    "and size - and say where it used to be. Two separate objects went? Name "
+    "both.\n"
     "  If several things went, name the most obvious one. If genuinely nothing "
     "was removed, change edit_operation to what actually happened instead."
 )
 
 
 # The removal SWEEP. A cheap, single-purpose question asked of pairs whose first
-# answer claimed NO removal but described only light/colour - the exact shape of
-# the miss the client reported: a wall-mounted wiper was taken off, the room then
-# looked "cleaner and better lit", and the model wrote "improved lighting and
-# enhanced color tones". That is a removal dressed up as a lighting change.
+# answer claimed NO removal but described only light/colour - the shape of the
+# miss the client reported: things were taken off a scene, the scene then looked
+# "cleaner and better lit", and the model wrote "improved lighting and enhanced
+# color tones". That is a removal dressed up as a lighting change.
 #
-# A separate request on purpose: as its own question the model has one job (diff
-# the objects), which is what it skips when asked five things at once.
+# The prompt contains NO list of example objects. An earlier version did, and the
+# model simply repeated whichever example fitted the room ("cable removed" from a
+# desk) instead of looking. It now works by SCAN: split the frame into a 3x3 grid,
+# inventory each cell, re-check the same cell in the edited image, and report a
+# thing as missing only if the place it occupied is now empty.
+#
+# Every finding it returns is then VERIFIED by a second, independent request
+# before it can reach the sheet, so a plausible-sounding guess is discarded.
 PROMPT_REMOVAL_SWEEP = (
-    "Look at the two images ONLY for things that DISAPPEARED.\n"
-    "  IMAGE 1 = the original.  IMAGE 2 = the final edit.\n"
-    "Compare them object by object and list everything present in IMAGE 1 that "
-    "is NOT in IMAGE 2. Look specifically at walls, floors, ceilings, corners, "
-    "shelves, counters and tables for fittings, fixtures, holders, rails, "
-    "hooks, brackets, signs, labels, bottles, buckets, bins, bags, boxes, "
-    "cables, cloths, stains, marks, dust, rubbish and stray objects.\n"
-    "  A removal often leaves a cleaner or better-lit result, so do NOT dismiss "
-    "a change as \"just lighting\" until you have checked what is physically "
-    "absent.\n\n"
+    "TASK: find what is MISSING from IMAGE 2 compared with IMAGE 1.\n"
+    "  IMAGE 1 = the original.  IMAGE 2 = the final edit.\n\n"
+    "Do not use any list of likely objects. Work by SCAN, not by guess:\n"
+    "  1. Divide IMAGE 1 into a 3x3 grid (top/middle/bottom x left/centre/"
+    "right).\n"
+    "  2. For each cell, list what you actually see in IMAGE 1.\n"
+    "  3. For each of those things, look at the SAME place in IMAGE 2 and "
+    "decide: is it still there?\n"
+    "  4. A thing is only MISSING if the place it occupied is now empty, "
+    "rebuilt, or shows the surface behind it. If you cannot point at the empty "
+    "place it used to occupy, it is NOT missing - do not report it.\n\n"
+    "Rules that matter for accuracy:\n"
+    "  - Name each missing thing by what YOU see: its shape, colour, material "
+    "and size. Describe it as you would to someone who has never seen the "
+    "photo. Never name something merely because it is common in a room like "
+    "this.\n"
+    "  - Report the individual things, not a group. If two separate objects "
+    "went, list them separately.\n"
+    "  - If something merely MOVED, CHANGED COLOUR, or is partly hidden by a "
+    "new object, it is NOT missing. Exclude it.\n"
+    "  - If a change is only light, colour, focus or framing, nothing was "
+    "removed.\n"
+    "  - Being unsure is a valid answer. A wrong object is worse than \"none\".\n\n"
     "Answer ONLY this JSON:\n"
-    '{"removed_objects": "...", "removed_from": "...", "still_present": "yes|no"}\n'
-    "  removed_objects - the concrete things that are gone, named specifically "
-    "(\"the wall-mounted wiper\", \"the blue bucket\", \"the towel rail\"). "
-    "Write \"none\" if nothing was removed.\n"
-    "  removed_from - where each was, in a few words (\"left wall\", \"shelf "
-    "above the counter\"). Empty if nothing was removed.\n"
-    "  still_present - \"no\" if at least one object was removed, else \"yes\"."
+    '{"removed": [{"what": "...", "where": "...", "confidence": 0.0}], '
+    '"still_present": "yes|no"}\n'
+    "  removed     - one entry per missing thing. `what` = the object exactly "
+    "as you see it, in plain words (its shape, colour, material, size - not a "
+    "category). `where` = the place it used to occupy, described relative to "
+    "what is still in the picture. `confidence` = 0.0-1.0, how certain you are "
+    "that it is genuinely gone.\n"
+    "  still_present - \"no\" if you found at least one genuinely missing "
+    "thing, else \"yes\".\n"
+    "  If nothing is missing, return {\"removed\": [], \"still_present\": "
+    "\"yes\"}."
+)
+
+# Second, independent look at ONE claimed object. A removal is only written to
+# the sheet when this confirms it, so a hallucinated object cannot reach a cell.
+PROMPT_VERIFY_REMOVAL = (
+    "VERIFY ONE CLAIM. A previous look at these two images said that in IMAGE 2 "
+    "the following is MISSING: \"{what}\" (it was at: \"{where}\").\n"
+    "  IMAGE 1 = the original.  IMAGE 2 = the final edit.\n\n"
+    "Check that ONE claim only, and be strict:\n"
+    "  1. Find that exact thing in IMAGE 1. If it is not in IMAGE 1 at all, the "
+    "claim is wrong.\n"
+    "  2. Look at the same place in IMAGE 2. Is it gone?\n"
+    "  3. If it is still visible in IMAGE 2 - even partly, even moved, even "
+    "recoloured - the claim is wrong.\n"
+    "  4. If the thing you were told about is not what you can actually see, "
+    "the claim is wrong: say so rather than agreeing.\n\n"
+    "Answer ONLY this JSON:\n"
+    '{"confirmed": "yes|no", "what_i_see_missing": "...", "where": "...", '
+    '"confidence": 0.0, "reason": "..."}\n'
+    "  confirmed              - \"yes\" only if you can see the empty place "
+    "where that thing used to be.\n"
+    "  what_i_see_missing     - if the claim was wrong but something ELSE is "
+    "genuinely missing there, name the real thing; otherwise \"none\".\n"
+    "  where                  - where that thing used to be.\n"
+    "  confidence             - 0.0-1.0 that it is genuinely gone.\n"
+    "  reason                 - one short clause (e.g. \"empty patch on desk\", "
+    "\"object still visible\")."
 )
 
 
@@ -351,6 +407,16 @@ EXTRA_COLUMNS = ["category"]
 # the model comes back short (see _normalise_keywords).
 MIN_KEYWORDS = 13
 MAX_KEYWORDS = 18
+
+# A removal is only written to a cell when a SECOND, independent look confirms
+# the object exists in IMAGE 1 and its place is empty in IMAGE 2, at or above
+# this confidence. Accuracy matters more than recall here: naming the wrong
+# object is worse than naming none, because the client cannot tell it is wrong.
+REMOVAL_VERIFY_MIN_CONFIDENCE = 0.7
+
+# A sweep may report several things; only this many are kept, most certain
+# first, so one generous model cannot bury a description in objects.
+REMOVAL_MAX_FINDINGS = 3
 
 # Fractional aspect-ratio change that counts as a crop rather than a resize.
 CROP_AR_TOLERANCE = 0.02
@@ -1368,6 +1434,7 @@ def _sanitise_label(label):
         "original_description": label.get("original_description", ""),
         "final_description": label.get("final_description", ""),
         "edit_operation": label.get("edit_operation", ""),
+        "edit_operation_note": label.get("edit_operation_note", ""),
     }, has_original=bool(label.get("original_description")
                          or label.get("edit_operation")))
 
@@ -1398,6 +1465,8 @@ def _normalise(data, has_original=True):
         "original_description": orig_desc,
         "final_description": final_desc,
         "edit_operation": ops,
+        # Carried through so a removal found by the sweep survives the cache.
+        "edit_operation_note": _clean_text(data.get("edit_operation_note", "")),
     }
 
 
@@ -1572,25 +1641,36 @@ def classify_image(orig_b64, edit_b64, api_key, model, provider="anthropic",
 
 def classify_pair(orig_b64, edit_b64, api_key, model, provider="anthropic",
                   retries=3, sweep=True):
-    """Label a pair, then ask follow-ups for the two documented misses.
+    """Label a pair, then follow up for the two documented misses.
 
-    `sweep=True` (the default) also catches the case the client reported: a
-    wall-mounted wiper was taken off, the room then looked cleaner, and the model
-    wrote "improved lighting and enhanced color tones" without ever mentioning a
-    removal. A second, single-purpose question fixes that.
+    Follow-up (a) handles a stated removal that names no object. Follow-up (b)
+    handles the harder case: the model described only light/colour while things
+    had actually been taken away - a removal makes a scene look cleaner, so it
+    gets written down as "improved lighting".
 
-    Both follow-ups can only ever IMPROVE the answer - a bad one leaves the first
-    label standing - so neither can make the sheet worse.
+    Follow-up (b) is a THREE-step process, because accuracy is the whole point:
 
-    Returns ``(label, follow_up)`` where `follow_up` is ``''``, ``'detail'`` or
-    ``'sweep'``, for the run log.
+      1. SWEEP  - one question, answered by scanning a 3x3 grid, returns a list
+                  of things that look missing, each with its own confidence.
+      2. VERIFY - every finding is checked again on its own, by a prompt that
+                  must locate the object in IMAGE 1 and see the empty place in
+                  IMAGE 2. A finding that cannot survive that is discarded, so
+                  a guessed object never reaches the sheet.
+      3. FOLD   - only the confirmed objects are written, capped, and joined
+                  into the description.
+
+    Neither follow-up can make the sheet worse: a failure leaves the original
+    label exactly as it was.
+
+    Returns ``(label, follow_up)`` with `follow_up` ``''``, ``'detail'`` or
+    ``'sweep'``.
     """
     label = classify_image(orig_b64, edit_b64, api_key, model, provider,
                            retries)
     if not orig_b64:
         return label, ""
 
-    # (a) object_removal with no object named -> ask for the noun.
+    # (a) it said object_removal but named no object.
     if remove_detail_needed(label):
         retry = classify_image(orig_b64, edit_b64, api_key, model, provider,
                                retries, extra_prompt=PROMPT_REMOVAL_DETAIL)
@@ -1599,15 +1679,34 @@ def classify_pair(orig_b64, edit_b64, api_key, model, provider="anthropic",
             return retry, "detail"
         return label, ""
 
-    # (b) no removal claimed, but the description only talks about light/colour
-    #     -> ask the single-purpose "what is gone?" question.
-    if sweep and removal_sweep_needed(label):
-        found = classify_image(orig_b64, edit_b64, api_key, model, provider,
-                               retries, extra_prompt=PROMPT_REMOVAL_SWEEP)
-        upgraded = fold_removal_sweep(label, found)
-        if upgraded is not label:
-            return upgraded, "sweep"
-    return label, ""
+    # (b) it claimed no removal but only talked about light/colour.
+    if not (sweep and removal_sweep_needed(label)):
+        return label, ""
+
+    found = classify_image(orig_b64, edit_b64, api_key, model, provider,
+                           retries, extra_prompt=PROMPT_REMOVAL_SWEEP)
+    findings = removal_findings(found)
+    if not findings:
+        return label, ""
+
+    findings.sort(key=lambda f: -f.get("confidence", 0.0))
+    verified = []
+    for finding in findings[:REMOVAL_MAX_FINDINGS]:
+        verdict = verify_removal(orig_b64, edit_b64, api_key, model, provider,
+                                 finding["what"], finding.get("where", ""),
+                                 retries)
+        if not _confirmed(finding, verdict):
+            continue
+        what = _clean_text(verdict.get("what_i_see_missing", "")).strip(" .")
+        if not what or what.lower() in ("none", "nothing", "n/a") \
+                or not names_removal(f"{what} removed"):
+            what = finding["what"]
+        verified.append({"what": what,
+                         "where": _clean_text(verdict.get("where", "")).strip(" .")
+                         or finding.get("where", "")})
+
+    upgraded = fold_removal_sweep(label, verified)
+    return (upgraded, "sweep") if upgraded is not label else (label, "")
 
 
 def remove_detail_needed(label):
@@ -1652,37 +1751,133 @@ def removal_sweep_needed(label):
     return any(cue in desc for cue in _LIGHT_ONLY_CUES)
 
 
-def fold_removal_sweep(label, sweep):
-    """Merge a removal-sweep answer into a label, when it found something.
+def removal_findings(sweep):
+    """Normalise a sweep answer into ``[{what, where, confidence}]``.
 
-    The sweep can only ADD a finding: if it says "none", or names a category
-    rather than an object, the original label stands untouched, so a bad sweep
-    can never damage a good row.
-
-    The finding is appended in the client's existing style ("Same scene with
-    improved lighting and the wall-mounted wiper removed"), and `object_removal`
-    is put at the FRONT of the operation list, because it is now the most
-    important thing that happened to the image.
+    The sweep returns a list, but an older/odd answer may come back as a single
+    string; both are accepted and reduced to the same shape. Anything that does
+    not name a concrete object is dropped here, so a category word can never
+    reach a cell.
     """
     if not isinstance(sweep, dict):
-        return label
-    removed = _clean_text(sweep.get("removed_objects", ""))
-    where = _clean_text(sweep.get("removed_from", ""))
-    if not removed or removed.lower().strip(".") in ("none", "nothing", "no", "nil"):
-        return label
-    # Only accept a CONCRETE object - the same rule the detail check enforces.
-    if not names_removal(f"{removed} removed"):
+        return []
+    raw = sweep.get("removed")
+    items = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                items.append(item)
+            elif str(item or "").strip():
+                items.append({"what": str(item), "where": "", "confidence": 0.5})
+    elif isinstance(raw, str) and raw.strip():
+        # Single-string answers ("the cup") still carry a real object.
+        items.append({"what": raw, "where": sweep.get("removed_from", ""),
+                      "confidence": 0.5})
+
+    out = []
+    for item in items:
+        what = _clean_text(item.get("what", "")).strip(" .")
+        where = _clean_text(item.get("where", "")).strip(" .")
+        if not what or what.lower() in ("none", "nothing", "no", "nil", "n/a"):
+            continue
+        try:
+            conf = float(item.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            conf = 0.5
+        # The object must be a concrete thing, not a category ("items", "tools").
+        if not names_removal(f"{what} removed"):
+            continue
+        out.append({"what": what, "where": where, "confidence": conf})
+    return out
+
+
+def verify_removal(orig_b64, edit_b64, api_key, model, provider, what, where,
+                   retries=3):
+    """Ask the model, on its own, whether ONE claimed removal is real.
+
+    This is the accuracy gate. A sweep can hallucinate an object - it names
+    something plausible for the room rather than something actually gone. So
+    every finding is checked twice: a second, independent look must find the
+    object IN IMAGE 1 and confirm its place is empty IN IMAGE 2.
+
+    The verifier is told what to check but not what to conclude; it is
+    explicitly told that agreeing when the object is still visible is wrong.
+    Returns the parsed dict, or {} when the call failed.
+    """
+    prompt = PROMPT_VERIFY_REMOVAL.format(what=what, where=where or "unspecified")
+    try:
+        return classify_image(orig_b64, edit_b64, api_key, model, provider,
+                             retries, extra_prompt=prompt)
+    except Exception:
+        return {}
+
+
+def _confirmed(finding, verdict):
+    """True if the independent check agrees the object is genuinely gone."""
+    if not isinstance(verdict, dict):
+        return False
+    if str(verdict.get("confirmed", "")).strip().lower() not in ("yes", "true", "y"):
+        return False
+    try:
+        conf = float(verdict.get("confidence", 0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    return conf >= REMOVAL_VERIFY_MIN_CONFIDENCE
+
+
+def fold_removal_sweep(label, confirmed):
+    """Add the verified removals to a label.
+
+    `confirmed` is the list of findings that already passed verification. Each
+    carries the object as the sweep or the verifier named it (the verifier wins
+    when it saw something different, because it looked at that one place
+    specifically).
+
+    The description is ONE short sentence with a hard word cap, so it cannot
+    carry several objects with their locations. It therefore names the objects
+    only ("and a white cup and a spectacle case removed"), while the exact
+    location of each goes to `edit_operation_note` - the template column that
+    exists for exactly this kind of detail and is otherwise blank.
+
+    The sweep can only ADD. An object already named in the description is
+    skipped, so nothing is duplicated.
+    """
+    out = dict(label)
+    added = []
+    for finding in confirmed or []:
+        what = _clean_text(finding.get("what", "")).strip(" .")
+        where = _clean_text(finding.get("where", "")).strip(" .")
+        if not what:
+            continue
+        if what.lower() in _clean_text(out.get("final_description", "")).lower():
+            continue
+        added.append({"what": what, "where": where})
+
+    if not added:
         return label
 
-    out = dict(label)
-    # Word order matters for readability: "the wipers removed from the wall",
-    # NOT "the wipers from the wall removed".
-    phrase = (f"{removed} removed from the {where}" if where
-              else f"{removed} removed")
+    # The sentence names the objects, joined so it stays short.
+    names = [a["what"] for a in added]
+    if len(names) == 1:
+        phrase = f"{names[0]} removed"
+    else:
+        phrase = f"{', '.join(names[:-1])} and {names[-1]} removed"
+
     desc = _clean_sentence(out.get("final_description", ""))
-    if removed.lower() not in desc.lower():
-        desc = f"{desc} and {phrase}" if desc else phrase.capitalize()
-        out["final_description"] = _normalise_description(desc)
+    candidate = f"{desc} and {phrase}" if desc else phrase[:1].upper() + phrase[1:]
+    trimmed = _normalise_description(candidate)
+    if len(trimmed.split()) > DESCRIPTION_MAX_WORDS or not trimmed.endswith("removed"):
+        # Too long for one sentence: keep the sentence as it was and let the
+        # note carry the removals. Nothing is lost, only relocated.
+        pass
+    else:
+        out["final_description"] = trimmed
+
+    # Full detail, with where each thing was, in the note column.
+    note = "; ".join(f"{a['what']} removed from {a['where']}" if a["where"]
+                     else f"{a['what']} removed" for a in added)
+    existing = _clean_text(out.get("edit_operation_note", ""))
+    out["edit_operation_note"] = f"{existing}; {note}" if existing else note
 
     ops = ops_ordered(out.get("edit_operation", ""))
     if "object_removal" in ops:
@@ -1690,7 +1885,6 @@ def fold_removal_sweep(label, sweep):
     ops.insert(0, "object_removal")
     out["edit_operation"] = ";".join(ops)
     return out
-
 
 # --------------------------------------------------------------------------- #
 # Excel rows
@@ -2002,7 +2196,8 @@ def main():
                 label.get("title", "") or title,
                 label.get("final_description", ""),
                 label.get("keywords", "") or keywords,
-                edit_meta, label.get("category", cat), ops, today))
+                edit_meta, label.get("category", cat), ops, today,
+                edit_operation_note=label.get("edit_operation_note", "")))
 
     all_columns = TEMPLATE_COLUMNS + EXTRA_COLUMNS
     note(f"excel   : {args.out}  ({len(excel_rows)} row(s), "

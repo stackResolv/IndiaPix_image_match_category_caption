@@ -563,7 +563,7 @@ def build_tasks(records):
 
 
 def row_dict(file_id, set_id, edit_state, role, title, description, keywords,
-             info, category, date, edit_operation=""):
+             info, category, date, edit_operation="", edit_operation_note=""):
     """One Excel row, keyed by column name (blank cells are empty strings)."""
     return {
         "file_id": file_id,
@@ -571,7 +571,10 @@ def row_dict(file_id, set_id, edit_state, role, title, description, keywords,
         "edit_state": edit_state,
         "role": role,
         "edit_operation": edit_operation,
-        "edit_operation_note": "",
+        # Where each removed object used to be. The description is one short
+        # sentence and cannot carry several locations, so the detail lives here
+        # (the template has this column for exactly that and left it blank).
+        "edit_operation_note": edit_operation_note,
         "title": title,
         "description": description,
         "keywords": keywords,
@@ -929,7 +932,8 @@ def stage_write(records, tasks, results, out_dir):
                 row = row_dict(os.path.basename(orig_path), set_id, "01", "final",
                                title, head.get("final_description", ""), keywords,
                                orig_info, category,
-                               orig_info.get("date_modified"), ops)
+                               orig_info.get("date_modified"), ops,
+                               head.get("edit_operation_note", ""))
                 row["date_contributed"] = today
                 sheet.add(row)
                 dw.writerow([r["set"], os.path.basename(orig_path), "final", "",
@@ -1003,7 +1007,8 @@ def stage_write(records, tasks, results, out_dir):
                                label.get("final_description", ""),
                                label.get("keywords", "") or keywords,
                                edit_info, edit_cat,
-                               edit_info.get("date_modified"), ops)
+                               edit_info.get("date_modified"), ops,
+                               label.get("edit_operation_note", ""))
                 row["date_contributed"] = today
                 sheet.add(row)
                 dw.writerow([r["set"], os.path.basename(r["files"][ei]), "final",
